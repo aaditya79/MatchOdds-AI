@@ -48,13 +48,18 @@ Agents debate across 2 rounds where they see and respond to each other's argumen
 
 ## Data Sources
 
+All sources are free. `nba_api` handles most of the heavy lifting with no rate limits.
+
 | Source | Provider | Purpose |
 |--------|----------|---------|
-| Game & Player Stats | `nba_api` | Box scores, team stats, standings, H2H |
-| Injuries | ESPN (scraped) | Current injury reports |
-| Betting Odds | The Odds API | Live odds from 9+ sportsbooks |
-| Historical Games | ChromaDB vector store | Similar matchup retrieval (9,840 games) |
-| News | ESPN, NBA.com (scraped) | Headlines and team mentions |
+| Game & Player Stats | `nba_api` | Box scores, team/player stats, game logs, standings, H2H (stats agent) |
+| Injuries | `nbainjuries` (official NBA reports) | Player status, injury type (stats + matchup agents) |
+| Betting Odds | The Odds API (free tier, **live demo only**); Kaggle (**historical evaluation**) | Cross-sportsbook odds, implied probabilities, line movement |
+| Sentiment | Reddit PRAW (r/nba, team subs) | Fan expectations, hype level, injury reactions (matchup agent) |
+| News | ESPN, Bleacher Report RSS | Late scratches, coach quotes, rest decisions (matchup agent) |
+| Vector Store | ChromaDB (built from `nba_api` data) | Historically similar games by metadata (all agents) |
+
+Evaluation sample: 150–200 games from recent NBA seasons via Kaggle datasets. The live Odds API free tier is reserved for the demo app.
 
 ## Setup
 
@@ -84,6 +89,7 @@ export ODDS_API_KEY="your_key"
 python3 nba_data_pipeline.py      # Step 1: Pull 4 seasons of NBA data
 python3 nba_injury_pipeline.py    # Step 2: Scrape current injuries
 python3 nba_odds_pipeline.py      # Step 3: Pull live odds
+python3 nba_reddit_pipeline.py    # Step 4: Scrape Reddit sentiment (optional)
 python3 nba_news_pipeline.py      # Step 5: Scrape news headlines
 python3 nba_vector_store.py       # Step 6: Build ChromaDB vector store
 ```
@@ -91,7 +97,7 @@ python3 nba_vector_store.py       # Step 6: Build ChromaDB vector store
 ### 4. Run the app
 
 ```bash
-streamlit run nba_streamlit_app_v3.py
+streamlit run nba_streamlit_app.py
 ```
 
 Opens at `http://localhost:8501`.
@@ -111,12 +117,13 @@ matchodds-ai/
 ├── nba_data_pipeline.py       # Step 1: nba_api data collection
 ├── nba_injury_pipeline.py     # Step 2: ESPN injury scraping
 ├── nba_odds_pipeline.py       # Step 3: The Odds API integration
+├── nba_reddit_pipeline.py     # Step 4: Reddit sentiment (optional)
 ├── nba_news_pipeline.py       # Step 5: News scraping
 ├── nba_vector_store.py        # Step 6: ChromaDB vector store
 ├── nba_agent.py               # Step 7: ReAct agent with tools
 ├── nba_multi_agent.py         # Step 8: Multi-agent debate system
 ├── nba_cot_baseline.py        # Step 9: Chain-of-thought baseline
-├── nba_streamlit_app_v3.py    # Step 10: Streamlit web app
+├── nba_streamlit_app.py       # Step 10: Streamlit web app
 ├── data/                      # Generated CSV data files
 │   ├── game_logs.csv
 │   ├── team_stats.csv
@@ -132,11 +139,19 @@ matchodds-ai/
 
 ## Research Questions
 
-**RQ1:** How does prediction quality relate to information density? (High-profile vs low-profile games)
+**RQ1:** How does prediction quality relate to information density? For each game we measure how much data the agent gathered (Reddit comments, news articles, vector store hits, context tokens) and plot prediction quality against it. Does the agent do better on high-profile games with more to work with, or on low-profile games where the market may be softer?
 
-**RQ2:** Does multi-agent debate with differentiated tool access outperform single-agent chain-of-thought?
+**RQ2:** Does a multi-agent debate with differentiated tool access outperform single-agent chain-of-thought reasoning?
 
-**RQ3:** Which data sources contribute most to prediction quality?
+**RQ3:** Which data sources (live stats, vector store historical context, sentiment, news, injury reports) contribute most to prediction quality?
+
+## Evaluation
+
+- **Prediction calibration:** Brier score and calibration curves for CoT vs. multi-agent debate. Market implied probability is the baseline.
+- **Information density vs. prediction quality:** Count data gathered per game (Reddit comments, news articles, vector store hits, context tokens) and plot Brier score against it, segmented by game profile.
+- **Ablation:** Remove one data source at a time and measure Brier score impact. Vector store on vs. off tested specifically to isolate the value of historical retrieval.
+- **Report quality:** Score 20–30 reports on factual accuracy, completeness, reasoning quality, and actionability.
+- **Secondary breakdowns:** Results sliced by back-to-back games, star player absences, and home vs. away.
 
 ## Requirements
 
@@ -155,9 +170,9 @@ praw             # optional, for Reddit
 
 ## Team
 
-- **Pranav Jain** — Data pipeline, vector store, CoT baseline
-- **Aaditya Pai** — Agent architecture, multi-agent debate, evaluation
-- **Tanish Patel** — Streamlit app, deployment, report quality
+- **Pranav Jain** — `nba_api` and injury tool wrappers, ChromaDB vector store, CoT baseline, ablation experiments.
+- **Aaditya Pai** — Odds API, Reddit PRAW, news RSS integration, agent prompts, ReAct loop, multi-agent debate, main evaluation pipeline.
+- **Tanish Patel** — Streamlit app, report layout, evaluation framework (Brier, calibration, info density), deployment, report quality review.
 
 STAT GR5293 | Spring 2026 | Columbia University
 
