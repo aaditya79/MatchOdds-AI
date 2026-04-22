@@ -29,26 +29,42 @@ from datetime import datetime
 DATA_DIR = "data"
 
 
-def tool_get_team_stats(team_abbr, season="2024-25"):
+def tool_get_team_stats(team_abbr, season=None):
     """Get recent team stats and form."""
     try:
         game_logs = pd.read_csv(f"{DATA_DIR}/game_logs.csv")
-        team_games = game_logs[
-            (game_logs["TEAM_ABBREVIATION"] == team_abbr) &
-            (game_logs["SEASON"] == season)
-        ].sort_values("GAME_DATE", ascending=False)
+        game_logs["GAME_DATE"] = pd.to_datetime(game_logs["GAME_DATE"], errors="coerce")
+
+        team_all = game_logs[game_logs["TEAM_ABBREVIATION"] == team_abbr].copy()
+        if team_all.empty:
+            return f"No data found for {team_abbr}."
+
+        # If no season is passed, choose the season of the most recent available game
+        if season is None:
+            latest_row = team_all.sort_values("GAME_DATE", ascending=False).iloc[0]
+            season = latest_row["SEASON"]
+
+        team_games = (
+            team_all[team_all["SEASON"] == season]
+            .sort_values("GAME_DATE", ascending=False)
+            .copy()
+        )
 
         if team_games.empty:
             return f"No data found for {team_abbr} in {season}."
 
         last_10 = team_games.head(10)
-        season_record = team_games
+
+        wins = int((team_games["WIN"] == 1).sum())
+        losses = int((team_games["WIN"] == 0).sum())
+        last_10_wins = int((last_10["WIN"] == 1).sum())
+        last_10_losses = int((last_10["WIN"] == 0).sum())
 
         result = {
             "team": team_abbr,
             "season": season,
-            "season_record": f"{int(season_record['WIN'].sum())}-{int((season_record['WIN'] == 0).sum())}",
-            "last_10_record": f"{int(last_10['WIN'].sum())}-{int((last_10['WIN'] == 0).sum())}",
+            "season_record": f"{wins}-{losses}",
+            "last_10_record": f"{last_10_wins}-{last_10_losses}",
             "avg_points_last_10": round(last_10["PTS"].mean(), 1),
             "avg_fg_pct_last_10": round(last_10["FG_PCT"].mean(), 3),
             "avg_fg3_pct_last_10": round(last_10["FG3_PCT"].mean(), 3),
@@ -141,6 +157,32 @@ def tool_get_injuries(team_name=None):
     except Exception as e:
         return f"Error getting injuries: {e}"
 
+def tool_get_team_sentiment(team_abbr):
+    """Get team-level media/news sentiment from aggregated news coverage."""
+    try:
+        sentiment = pd.read_csv(f"{DATA_DIR}/team_sentiment.csv")
+
+        team_row = sentiment[sentiment["TEAM"] == team_abbr]
+
+        if team_row.empty:
+            return f"No sentiment data found for {team_abbr}."
+
+        row = team_row.iloc[0]
+        result = {
+            "team": row["TEAM"],
+            "article_count": int(row["ARTICLE_COUNT"]),
+            "avg_sentiment": round(float(row["AVG_SENTIMENT"]), 3),
+            "positive_article_count": int(row["POSITIVE_ARTICLE_COUNT"]),
+            "negative_article_count": int(row["NEGATIVE_ARTICLE_COUNT"]),
+            "sentiment_label": (
+                "positive" if float(row["AVG_SENTIMENT"]) > 0.05
+                else "negative" if float(row["AVG_SENTIMENT"]) < -0.05
+                else "neutral"
+            ),
+        }
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error getting sentiment for {team_abbr}: {e}"
 
 def tool_get_odds(home_team=None, away_team=None):
     """Get current betting odds for upcoming games."""
@@ -164,7 +206,12 @@ def tool_get_odds(home_team=None, away_team=None):
             ]
 
         if h2h_odds.empty:
-            return f"No odds found for {home_team} vs {away_team}."
+            return (
+                f"No live odds found for {home_team} vs {away_team}. "
+                f"This selected matchup does not appear in the current upcoming-games odds feed, "
+                f"so these teams may not actually be scheduled to play each other right now. "
+                f"Choose a matchup that exists in the live odds feed to enable value assessment."
+            )
 
         # Group by game and summarize
         games = {}
@@ -237,6 +284,10 @@ TOOLS = {
         "function": tool_search_similar_games,
         "description": "Search historical games for similar situations. Args: query_text (natural language), team (optional, team abbreviation), n_results (optional, default 5)",
     },
+    "get_team_sentiment": {
+    "function": tool_get_team_sentiment,
+    "description": "Get recent team-level media/news sentiment. Args: team_abbr (e.g. 'LAL', 'BOS')",
+    },
 }
 
 
@@ -260,6 +311,8 @@ CRITICAL RULES:
 - Every number in your report must come from a tool observation, not from your training data.
 - If you produce a FINAL REPORT without calling tools first, it will be rejected.
 - Call ONE tool per response. Do not call multiple tools in the same message.
+- You SHOULD call get_team_sentiment for both teams before producing the FINAL REPORT.
+- If odds are unavailable, you must explicitly explain that the selected matchup does not appear in the current upcoming-games odds feed and tell the user to choose a matchup that actually exists in the live odds feed.
 
 You have access to the following tools:
 {tool_descriptions}
@@ -295,11 +348,11 @@ FINAL REPORT:
         {{"factor": "...", "impact": "favors_home/favors_away/neutral", "importance": "high/medium/low"}},
     ],
     "reasoning": "Step-by-step reasoning chain...",
-    "value_assessment": "Does the agent see value vs the market? Where and why?"
+        "value_assessment": "Does the agent see value vs the market? Where and why? If no live odds are available, explicitly say that the selected matchup does not appear in the current upcoming-games odds feed and tell the user to choose a real upcoming matchup from the live odds feed."
 }}
 
-Be thorough but efficient. Gather stats for both teams, check injuries, look at odds, 
-and search for historical precedent. Then reason through it all step by step."""
+Be thorough but efficient. Gather stats for both teams, check injuries, look at odds,
+check team media/news sentiment, and search for historical precedent. Then reason through it all step by step."""
 
 
 def parse_action(text):
@@ -346,7 +399,7 @@ def call_tool(tool_name, kwargs):
         return f"Error: {e}"
 
 
-def run_agent(game_description, llm_call_fn, max_steps=8):
+def run_agent(game_description, llm_call_fn, max_steps=12):
     """
     Run the ReAct agent loop.
 

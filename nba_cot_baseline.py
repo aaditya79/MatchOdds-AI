@@ -11,7 +11,7 @@ Usage:
     export ANTHROPIC_API_KEY="your_key"   (or OPENAI_API_KEY)
     python nba_cot_baseline.py
 
-Requires: steps 1-3 and 6 completed (data/ populated)
+Requires: steps 1-3 and 5 completed (data/ populated)
 """
 
 import os
@@ -24,6 +24,7 @@ from nba_agent import (
     tool_get_injuries,
     tool_get_odds,
     tool_search_similar_games,
+    tool_get_team_sentiment,
     DATA_DIR,
 )
 
@@ -40,31 +41,30 @@ def gather_all_evidence(home_team_abbr, away_team_abbr, home_team_name, away_tea
     print("Gathering all evidence upfront...")
     evidence = {}
 
-    # Home team stats
     print(f"  Getting {home_team_abbr} stats...")
     evidence["home_team_stats"] = tool_get_team_stats(home_team_abbr)
 
-    # Away team stats
     print(f"  Getting {away_team_abbr} stats...")
     evidence["away_team_stats"] = tool_get_team_stats(away_team_abbr)
 
-    # Head to head
     print(f"  Getting H2H record...")
     evidence["head_to_head"] = tool_get_head_to_head(home_team_abbr, away_team_abbr)
 
-    # Home team injuries
     print(f"  Getting {home_team_name} injuries...")
     evidence["home_injuries"] = tool_get_injuries(home_team_name)
 
-    # Away team injuries
     print(f"  Getting {away_team_name} injuries...")
     evidence["away_injuries"] = tool_get_injuries(away_team_name)
 
-    # Odds
+    print(f"  Getting {home_team_abbr} sentiment...")
+    evidence["home_team_sentiment"] = tool_get_team_sentiment(home_team_abbr)
+
+    print(f"  Getting {away_team_abbr} sentiment...")
+    evidence["away_team_sentiment"] = tool_get_team_sentiment(away_team_abbr)
+
     print(f"  Getting odds...")
     evidence["odds"] = tool_get_odds(home_team_name, away_team_name)
 
-    # Historical similar games for home team
     print(f"  Searching similar games for {home_team_abbr}...")
     evidence["similar_home"] = tool_search_similar_games(
         f"{home_team_abbr} home game recent form",
@@ -72,7 +72,6 @@ def gather_all_evidence(home_team_abbr, away_team_abbr, home_team_name, away_tea
         n_results=3
     )
 
-    # Historical similar games for away team
     print(f"  Searching similar games for {away_team_abbr}...")
     evidence["similar_away"] = tool_search_similar_games(
         f"{away_team_abbr} away game recent form",
@@ -80,15 +79,20 @@ def gather_all_evidence(home_team_abbr, away_team_abbr, home_team_name, away_tea
         n_results=3
     )
 
-    # Count information density
     total_chars = sum(len(str(v)) for v in evidence.values())
     evidence["_info_density"] = {
         "total_characters": total_chars,
-        "sources_with_data": sum(1 for v in evidence.values() if v and str(v) != "[]" and "No " not in str(v)[:20]),
-        "total_sources_queried": len(evidence) - 1,  # exclude _info_density itself
+        "sources_with_data": sum(
+            1 for v in evidence.values()
+            if v and str(v) != "[]" and "No " not in str(v)[:20]
+        ),
+        "total_sources_queried": len(evidence),
     }
 
-    print(f"  Total evidence: {total_chars} characters from {evidence['_info_density']['sources_with_data']} sources")
+    print(
+        f"  Total evidence: {total_chars} characters from "
+        f"{evidence['_info_density']['sources_with_data']} sources"
+    )
     return evidence
 
 
@@ -119,6 +123,12 @@ GAME: {game_description}
 === AWAY TEAM INJURIES ===
 {evidence['away_injuries']}
 
+=== HOME TEAM MEDIA / NEWS SENTIMENT ===
+{evidence['home_team_sentiment']}
+
+=== AWAY TEAM MEDIA / NEWS SENTIMENT ===
+{evidence['away_team_sentiment']}
+
 === BETTING ODDS ===
 {evidence['odds']}
 
@@ -134,6 +144,11 @@ GAME: {game_description}
 INSTRUCTIONS:
 Think through this step by step. Consider each piece of evidence, weigh its importance,
 and arrive at a prediction. Be explicit about your reasoning chain.
+
+Use media/news sentiment and article coverage as a secondary contextual signal.
+Do not let sentiment outweigh hard statistics, injuries, or market information.
+
+If live odds are unavailable, explicitly explain that the selected matchup does not appear in the current upcoming-games odds feed. Say this usually means the selected teams are not actually scheduled to play each other in the current live odds dataset, and tell the user to choose a matchup that exists in the live odds feed to enable value assessment.
 
 Then produce your analysis in this exact JSON format:
 
@@ -155,7 +170,7 @@ FINAL REPORT:
         {{"factor": "...", "impact": "favors_home/favors_away/neutral", "importance": "high/medium/low"}}
     ],
     "reasoning": "Your complete step-by-step reasoning chain...",
-    "value_assessment": "Where do you see value vs the market?"
+    "value_assessment": "Where do you see value vs the market? If no live odds are available, explicitly explain that the selected matchup does not appear in the current upcoming-games odds feed and tell the user to choose a matchup that exists in the live odds feed."
 }}"""
 
 
@@ -204,13 +219,9 @@ def run_cot_analysis(home_abbr, away_abbr, home_name, away_name, game_descriptio
     2. Send everything to the LLM in one prompt
     3. Get back a single-pass analysis
     """
-    # Gather evidence
     evidence = gather_all_evidence(home_abbr, away_abbr, home_name, away_name)
-
-    # Build prompt
     prompt = build_cot_prompt(game_description, evidence)
 
-    # Single LLM call
     print("\nRunning chain-of-thought analysis (single pass)...")
     messages = [
         {"role": "user", "content": prompt},
@@ -233,7 +244,6 @@ def main():
     print("NBA CoT Baseline - Step 9")
     print("=" * 60)
 
-    # Choose LLM
     if os.environ.get("ANTHROPIC_API_KEY"):
         print("Using Claude (Anthropic) API")
         llm_fn = call_anthropic
@@ -244,7 +254,6 @@ def main():
         print("No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.")
         return
 
-    # Test game (same as step 7 and 8 for comparison)
     result = run_cot_analysis(
         home_abbr="BOS",
         away_abbr="LAL",
@@ -254,7 +263,6 @@ def main():
         llm_call_fn=llm_fn,
     )
 
-    # Print report
     print()
     print("=" * 60)
     print("COT BASELINE REPORT")
@@ -271,7 +279,6 @@ def main():
     print(f"LLM calls: {result['llm_calls']}")
     print(f"Info density: {result['info_density']}")
 
-    # Save
     log_path = f"{DATA_DIR}/cot_baseline_log.json"
     save_data = {
         "game": result["game"],
@@ -285,7 +292,6 @@ def main():
         json.dump(save_data, f, indent=2, default=str)
     print(f"Log saved to {log_path}")
 
-    # Comparison note
     print()
     print("=" * 60)
     print("TO COMPARE WITH MULTI-AGENT DEBATE:")

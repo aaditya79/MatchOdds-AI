@@ -6,12 +6,12 @@ debate an NBA game across iterative rounds.
 Agents:
   1. Stats Agent - focuses on numbers (scoring, defense, pace, efficiency)
      Tools: get_team_stats, get_head_to_head, search_similar_games (quantitative only)
-  
+
   2. Matchup Agent - focuses on context (schedule, travel, rest, coaching, sentiment)
-     Tools: get_injuries, search_similar_games (contextual), news/reddit (when available)
-  
+     Tools: get_injuries, search_similar_games, get_team_sentiment
+
   3. Market Agent - starts from the odds and confirms or challenges them
-     Tools: get_odds, get_team_stats, get_injuries, search_similar_games (any)
+     Tools: get_odds, get_team_stats, get_injuries, search_similar_games, get_team_sentiment
 
 Debate flow:
   Round 1: Each agent independently analyzes and predicts
@@ -23,28 +23,24 @@ Usage:
     export ANTHROPIC_API_KEY="your_key"   (or OPENAI_API_KEY)
     python nba_multi_agent.py
 
-Requires: steps 1-3, 6, and 7 to be completed
+Requires: steps 1-3, 5, 6, and 7 to be completed
 """
 
 import os
 import json
 from datetime import datetime
 
-# Import tools from the single agent
 from nba_agent import (
     tool_get_team_stats,
     tool_get_head_to_head,
     tool_get_injuries,
     tool_get_odds,
     tool_search_similar_games,
+    tool_get_team_sentiment,
     parse_action,
     DATA_DIR,
 )
 
-
-# ============================================================
-# AGENT DEFINITIONS
-# ============================================================
 
 AGENTS = {
     "stats_agent": {
@@ -56,7 +52,7 @@ AGENTS = {
         },
         "system_prompt": """You are the Stats & Metrics Agent. You analyze NBA games purely through numbers.
 
-You focus on: scoring averages, defensive rating, pace, field goal percentages, 
+You focus on: scoring averages, defensive rating, pace, field goal percentages,
 rebounding, assists, turnovers, plus/minus, and historical statistical patterns.
 
 You have access to these tools ONLY:
@@ -89,18 +85,22 @@ Start by calling get_team_stats for the home team.""",
         "tools": {
             "get_injuries": tool_get_injuries,
             "search_similar_games": tool_search_similar_games,
+            "get_team_sentiment": tool_get_team_sentiment,
         },
         "system_prompt": """You are the Matchup & Context Agent. You analyze NBA games through situational context.
 
-You focus on: injuries and their impact, schedule factors (back-to-backs, rest days, 
-travel), home/away dynamics, coaching matchups, momentum, and team narrative.
+You focus on: injuries and their impact, schedule factors (back-to-backs, rest days,
+travel), home/away dynamics, coaching matchups, momentum, team narrative, and media sentiment.
 
 You have access to these tools ONLY:
   - get_injuries(team_name): Get current injury report for a team
   - search_similar_games(query_text, team, n_results): Search for historically similar situations
+  - get_team_sentiment(team_abbr): Get recent media/news sentiment and coverage for a team
 
 RULES:
-- You MUST call at least 2 tools before giving your analysis.
+- You MUST call get_injuries for both teams.
+- You MUST call get_team_sentiment for both teams before giving your analysis.
+- You MUST call at least 3 tools before giving your analysis.
 - Call ONE tool per response.
 - Base every claim on data from tool observations. Do not make up numbers.
 - When calling a tool, use: ACTION: tool_name(arg1="value1")
@@ -126,21 +126,25 @@ Start by calling get_injuries for the home team.""",
             "get_team_stats": tool_get_team_stats,
             "get_injuries": tool_get_injuries,
             "search_similar_games": tool_search_similar_games,
+            "get_team_sentiment": tool_get_team_sentiment,
         },
-        "system_prompt": """You are the Market & Odds Agent. You start from the bookmaker odds and try to 
+        "system_prompt": """You are the Market & Odds Agent. You start from the bookmaker odds and try to
 confirm or challenge them.
 
-You focus on: what the market thinks, where the line has moved, whether the odds 
-reflect the true probabilities, and where there might be value.
+You focus on: what the market thinks, where the line has moved, whether the odds
+reflect the true probabilities, where there might be value, and whether media sentiment
+or coverage intensity suggests the market narrative is overreacting or underreacting.
 
 You have access to these tools:
   - get_odds(home_team, away_team): Get current odds from multiple sportsbooks
   - get_team_stats(team_abbr, season): Get team stats to cross-check market pricing
   - get_injuries(team_name): Check if injuries are properly priced in
   - search_similar_games(query_text, team, n_results): Find historical precedent
+  - get_team_sentiment(team_abbr): Get recent media/news sentiment and coverage for a team
 
 RULES:
-- You MUST call get_odds first, then at least 1 more tool.
+- You MUST call get_odds first, then at least 2 more tools.
+- You SHOULD call get_team_sentiment for both teams before giving your analysis.
 - Call ONE tool per response.
 - Base every claim on data from tool observations. Do not make up numbers.
 - When calling a tool, use: ACTION: tool_name(arg1="value1")
@@ -163,15 +167,7 @@ Start by calling get_odds for this game.""",
 }
 
 
-# ============================================================
-# AGENT RUNNER
-# ============================================================
-
-def run_single_agent(agent_key, game_description, llm_call_fn, extra_context="", max_steps=5):
-    """
-    Run a single agent's data gathering and analysis phase.
-    Returns the agent's analysis.
-    """
+def run_single_agent(agent_key, game_description, llm_call_fn, extra_context="", max_steps=7):
     agent = AGENTS[agent_key]
     print(f"\n{'='*50}")
     print(f"  {agent['name']}")
@@ -190,16 +186,13 @@ def run_single_agent(agent_key, game_description, llm_call_fn, extra_context="",
     while step < max_steps:
         response_text = llm_call_fn(messages)
 
-        # Check if agent produced analysis
         if "ANALYSIS:" in response_text:
             print(f"  Step {step+1}: ANALYSIS produced")
             return response_text
 
-        # Parse and execute action
         tool_name, kwargs, action_line = parse_action(response_text)
 
         if tool_name:
-            # Check if agent has access to this tool
             if tool_name in agent["tools"]:
                 print(f"  Step {step+1}: {tool_name}({kwargs})")
                 result = agent["tools"][tool_name](**kwargs)
@@ -211,8 +204,10 @@ def run_single_agent(agent_key, game_description, llm_call_fn, extra_context="",
                 messages.append({"role": "user", "content": f"OBSERVATION: {result}"})
             else:
                 messages.append({"role": "assistant", "content": response_text})
-                messages.append({"role": "user", "content": 
-                    f"ERROR: You don't have access to {tool_name}. Your tools are: {list(agent['tools'].keys())}"})
+                messages.append({
+                    "role": "user",
+                    "content": f"ERROR: You don't have access to {tool_name}. Your tools are: {list(agent['tools'].keys())}"
+                })
                 print(f"  Step {step+1}: DENIED {tool_name} (not in this agent's tools)")
         else:
             messages.append({"role": "assistant", "content": response_text})
@@ -220,19 +215,19 @@ def run_single_agent(agent_key, game_description, llm_call_fn, extra_context="",
 
         step += 1
 
-    # Force analysis if max steps reached
-    messages.append({"role": "user", "content": "Produce your ANALYSIS now based on the data you have."})
+    messages.append({
+        "role": "user",
+        "content": "Do not call any more tools. Produce your ANALYSIS now using only the information already gathered."
+    })
     response_text = llm_call_fn(messages)
     return response_text
 
 
 def extract_analysis(response_text):
-    """Extract the JSON analysis from an agent's response."""
     if "ANALYSIS:" not in response_text:
         return None
     try:
         json_str = response_text.split("ANALYSIS:")[-1].strip()
-        # Find the JSON object
         start = json_str.find("{")
         end = json_str.rfind("}") + 1
         if start >= 0 and end > start:
@@ -243,9 +238,6 @@ def extract_analysis(response_text):
 
 
 def run_debate_round(game_description, agent_analyses, round_num, llm_call_fn):
-    """
-    Run a debate round where each agent sees and responds to the others' analyses.
-    """
     print(f"\n{'#'*60}")
     print(f"  DEBATE ROUND {round_num}")
     print(f"{'#'*60}")
@@ -253,7 +245,6 @@ def run_debate_round(game_description, agent_analyses, round_num, llm_call_fn):
     updated_analyses = {}
 
     for agent_key in AGENTS:
-        # Build context from other agents
         other_analyses = []
         for other_key, analysis in agent_analyses.items():
             if other_key != agent_key:
@@ -261,7 +252,7 @@ def run_debate_round(game_description, agent_analyses, round_num, llm_call_fn):
                 other_analyses.append(f"{other_name}:\n{json.dumps(analysis, indent=2)}")
 
         context = "\n\n".join(other_analyses)
-        debate_prompt = f"""The other agents have shared their analyses. Review their arguments 
+        debate_prompt = f"""The other agents have shared their analyses. Review their arguments
 and update your position if warranted. You may agree, disagree, or adjust your prediction.
 
 If you want to gather more data to challenge their claims, you can call a tool first.
@@ -278,10 +269,8 @@ Other agents' positions:
 
         print(f"\n  {agent['name']} responding to debate...")
 
-        # Allow one tool call then analysis
         response_text = llm_call_fn(messages)
 
-        # If agent wants to call a tool
         tool_name, kwargs, _ = parse_action(response_text)
         if tool_name and tool_name in agent["tools"]:
             print(f"    Tool call: {tool_name}({kwargs})")
@@ -299,7 +288,6 @@ Other agents' positions:
             pred = analysis.get("prediction", {})
             print(f"    Updated prediction: Home {pred.get('home_win_prob', '?')} | Away {pred.get('away_win_prob', '?')}")
         else:
-            # Keep old analysis if parsing failed
             updated_analyses[agent_key] = agent_analyses.get(agent_key, {})
             print(f"    Kept previous position (parse failed)")
 
@@ -307,9 +295,6 @@ Other agents' positions:
 
 
 def moderate(game_description, agent_analyses, llm_call_fn):
-    """
-    Moderator synthesizes all agents' analyses into a final report.
-    """
     print(f"\n{'#'*60}")
     print(f"  MODERATOR SYNTHESIS")
     print(f"{'#'*60}")
@@ -319,7 +304,7 @@ def moderate(game_description, agent_analyses, llm_call_fn):
         agent_name = AGENTS[agent_key]["name"]
         analyses_text += f"\n{agent_name}:\n{json.dumps(analysis, indent=2)}\n"
 
-    moderator_prompt = f"""You are the Moderator. Three specialized agents have analyzed this NBA game 
+    moderator_prompt = f"""You are the Moderator. Three specialized agents have analyzed this NBA game
 and debated their positions. Your job is to synthesize their analyses into one final betting report.
 
 Game: {game_description}
@@ -332,7 +317,10 @@ Consider:
 - Where do they disagree? Weigh each agent's reasoning and data quality.
 - The Stats Agent is most reliable for performance metrics.
 - The Matchup Agent is most reliable for injury impact and schedule effects.
+- The Matchup Agent is also most reliable for media/news sentiment and coverage context.
 - The Market Agent is most reliable for understanding what the odds already reflect.
+
+If market odds are unavailable or null, the value_assessment must clearly explain that no live odds were found for the selected matchup in the current upcoming-games odds feed. Say that this usually means the selected teams are not actually scheduled to play each other in the current live odds dataset, and tell the user to choose a matchup that exists in the live odds feed.
 
 Produce the FINAL REPORT in this JSON format:
 {{
@@ -359,21 +347,20 @@ Produce the FINAL REPORT in this JSON format:
     "areas_of_agreement": ["..."],
     "areas_of_disagreement": ["..."],
     "reasoning": "Step-by-step synthesis...",
-    "value_assessment": "Where does the synthesized view differ from the market?"
+    "value_assessment": "Where does the synthesized view differ from the market? If no live odds are available, explicitly say that the selected matchup does not appear in the current upcoming-games odds feed and tell the user to choose a matchup that actually exists in the live odds feed."
 }}"""
 
     messages = [
-        {"role": "system", "content": "You are a moderator synthesizing multiple expert analyses into a final betting report. Use only the data provided by the agents. Do not introduce new information."},
+        {
+            "role": "system",
+            "content": "You are a moderator synthesizing multiple expert analyses into a final betting report. Use only the data provided by the agents. Do not introduce new information."
+        },
         {"role": "user", "content": moderator_prompt},
     ]
 
     response = llm_call_fn(messages)
     return response
 
-
-# ============================================================
-# LLM BACKENDS (same as nba_agent.py)
-# ============================================================
 
 def call_anthropic(messages):
     import anthropic
@@ -405,23 +392,11 @@ def call_openai(messages):
     return response.choices[0].message.content
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def run_full_debate(game_description, llm_call_fn, num_debate_rounds=2):
-    """
-    Run the full multi-agent debate pipeline.
-    
-    1. Each agent independently gathers data and analyzes
-    2. Agents debate for num_debate_rounds rounds
-    3. Moderator synthesizes final report
-    """
     print("=" * 60)
     print(f"MULTI-AGENT DEBATE: {game_description}")
     print("=" * 60)
 
-    # Phase 1: Independent analysis
     print(f"\n{'#'*60}")
     print(f"  PHASE 1: INDEPENDENT ANALYSIS")
     print(f"{'#'*60}")
@@ -441,11 +416,9 @@ def run_full_debate(game_description, llm_call_fn, num_debate_rounds=2):
             agent_analyses[agent_key] = {"error": "Failed to parse analysis", "raw": response[:500]}
             print(f"  -> Failed to parse analysis")
 
-    # Phase 2: Debate rounds
     for round_num in range(1, num_debate_rounds + 1):
         agent_analyses = run_debate_round(game_description, agent_analyses, round_num, llm_call_fn)
 
-    # Phase 3: Moderator synthesis
     final_report = moderate(game_description, agent_analyses, llm_call_fn)
 
     return {
@@ -461,7 +434,6 @@ def main():
     print("NBA Multi-Agent Debate - Step 8")
     print("=" * 60)
 
-    # Choose LLM backend
     if os.environ.get("ANTHROPIC_API_KEY"):
         print("Using Claude (Anthropic) API")
         llm_fn = call_anthropic
@@ -472,19 +444,16 @@ def main():
         print("No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.")
         return
 
-    # Test game
     game = "Los Angeles Lakers vs Boston Celtics, March 30 2026"
 
     result = run_full_debate(game, llm_fn, num_debate_rounds=2)
 
-    # Print final report
     print()
     print("=" * 60)
     print("FINAL SYNTHESIZED REPORT")
     print("=" * 60)
     print(result["final_report"])
 
-    # Save everything
     log_path = f"{DATA_DIR}/multi_agent_log.json"
     save_data = {
         "game": result["game"],
@@ -497,7 +466,6 @@ def main():
         json.dump(save_data, f, indent=2, default=str)
     print(f"\nFull debate log saved to {log_path}")
 
-    # Print comparison
     print()
     print("=" * 60)
     print("AGENT PREDICTION COMPARISON")

@@ -181,6 +181,10 @@ def main():
     print("=" * 60)
     print("NBA Odds Pipeline - Step 3")
     print("=" * 60)
+    
+    live_path = f"{DATA_DIR}/odds_live.csv"
+    if os.path.exists(live_path):
+        os.remove(live_path)
 
     # 1. Pull live odds (for demo)
     live_odds = pull_live_odds()
