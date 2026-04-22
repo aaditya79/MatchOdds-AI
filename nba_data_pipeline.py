@@ -60,7 +60,23 @@ def get_recent_nba_seasons(n_seasons=4):
     return seasons
 
 
-SEASONS = get_recent_nba_seasons(4)
+USE_FIXED_SEASONS = True
+
+if USE_FIXED_SEASONS:
+    SEASONS = [
+        "2017-18",
+        "2018-19",
+        "2019-20",
+        "2020-21",
+        "2021-22",
+        "2022-23",
+        "2023-24",
+        "2024-25",
+        "2025-26",
+    ]
+else:
+    SEASONS = get_recent_nba_seasons(4)
+    
 DATA_DIR = "data"
 SLEEP_BETWEEN_CALLS = 0.6  # nba.com rate limiting - be polite
 

@@ -101,6 +101,14 @@ def load_game_logs():
     return df
 
 
+def load_historical_odds():
+    path = f"{DATA_DIR}/odds_historical.csv"
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        return df
+    return pd.DataFrame()
+
+
 def build_unique_games(game_logs):
     rows = []
 
@@ -528,6 +536,104 @@ def select_backtest_games(unique_games, n_games, season_filter):
 
 
 # ============================================================
+# HISTORICAL MARKET MATCHING
+# ============================================================
+
+def american_to_implied_prob(odds):
+    if pd.isna(odds):
+        return None
+    odds = float(odds)
+    if odds > 0:
+        return 100.0 / (odds + 100.0)
+    return abs(odds) / (abs(odds) + 100.0)
+
+
+def normalize_team_name(name):
+    mapping = {
+        "ATL": "Atlanta",
+        "BOS": "Boston",
+        "BKN": "Brooklyn",
+        "CHA": "Charlotte",
+        "CHI": "Chicago",
+        "CLE": "Cleveland",
+        "DAL": "Dallas",
+        "DEN": "Denver",
+        "DET": "Detroit",
+        "GSW": "Golden State",
+        "HOU": "Houston",
+        "IND": "Indiana",
+        "LAC": "L.A. Clippers",
+        "LAL": "L.A. Lakers",
+        "MEM": "Memphis",
+        "MIA": "Miami",
+        "MIL": "Milwaukee",
+        "MIN": "Minnesota",
+        "NOP": "New Orleans",
+        "NYK": "New York",
+        "OKC": "Oklahoma City",
+        "ORL": "Orlando",
+        "PHI": "Philadelphia",
+        "PHX": "Phoenix",
+        "POR": "Portland",
+        "SAC": "Sacramento",
+        "SAS": "San Antonio",
+        "TOR": "Toronto",
+        "UTA": "Utah",
+        "WAS": "Washington",
+    }
+    return mapping.get(str(name), str(name))
+
+
+def match_market_prob(odds_df, game_date, home_team, away_team):
+    if odds_df.empty:
+        return None
+
+    df = odds_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    target_date = pd.to_datetime(game_date).date()
+
+    home_team_name = normalize_team_name(home_team)
+    away_team_name = normalize_team_name(away_team)
+
+    home_rows = df[
+        (df["Date"] == target_date) &
+        (df["Location"].astype(str).str.lower() == "home") &
+        (df["Team"].astype(str) == home_team_name) &
+        (df["OppTeam"].astype(str) == away_team_name)
+    ].copy()
+
+    away_rows = df[
+        (df["Date"] == target_date) &
+        (df["Location"].astype(str).str.lower() == "away") &
+        (df["Team"].astype(str) == away_team_name) &
+        (df["OppTeam"].astype(str) == home_team_name)
+    ].copy()
+
+    if home_rows.empty or away_rows.empty:
+        return None
+
+    home_row = home_rows.iloc[0]
+    away_row = away_rows.iloc[0]
+
+    home_ml = home_row.get("Average_Line_ML")
+    away_ml = away_row.get("Average_Line_ML")
+
+    home_prob = american_to_implied_prob(home_ml)
+    away_prob = american_to_implied_prob(away_ml)
+
+    if home_prob is None or away_prob is None:
+        return None
+
+    total = home_prob + away_prob
+    if total <= 0:
+        return None
+
+    return {
+        "home_implied_prob": home_prob / total,
+        "away_implied_prob": away_prob / total,
+    }
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -540,6 +646,7 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
     print(f"Using model backend: {llm_name}")
 
     game_logs = load_game_logs()
+    odds_hist = load_historical_odds()
     unique_games = build_unique_games(game_logs)
     test_games = select_backtest_games(unique_games, n_games=n_games, season_filter=season_filter)
 
@@ -547,6 +654,7 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
 
     rows = []
     skipped = 0
+    failed_method_calls = 0
 
     for i, (_, game_row) in enumerate(test_games.iterrows(), start=1):
         snapshot = build_historical_snapshot(game_logs, game_row, min_games_history=min_games_history)
@@ -556,6 +664,19 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
 
         game_label = f"{snapshot['game']['away_team']} @ {snapshot['game']['home_team']} on {snapshot['game']['date']}"
         actual_home_win = int(game_row["HOME_WIN"])
+
+        market_match = match_market_prob(
+            odds_hist,
+            snapshot["game"]["date"],
+            snapshot["game"]["home_team"],
+            snapshot["game"]["away_team"],
+        )
+
+        market_home_implied_prob = None
+        market_away_implied_prob = None
+        if market_match:
+            market_home_implied_prob = market_match["home_implied_prob"]
+            market_away_implied_prob = market_match["away_implied_prob"]
 
         print()
         print(f"[{i}/{len(test_games)}] {game_label}")
@@ -604,6 +725,8 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
                     "confidence": parsed.get("confidence", ""),
                     "key_factors": json.dumps(parsed.get("key_factors", [])),
                     "reasoning": parsed.get("reasoning", ""),
+                    "market_home_implied_prob": market_home_implied_prob,
+                    "market_away_implied_prob": market_away_implied_prob,
                     "raw_response": raw,
                 })
 
@@ -611,6 +734,7 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
                 time.sleep(SLEEP_BETWEEN_CALLS)
 
             except Exception as e:
+                failed_method_calls += 1
                 print(f"  {method_name}: FAILED -> {e}")
 
     if not rows:
@@ -630,6 +754,7 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
         "min_games_history": int(min_games_history),
         "candidate_games_selected": int(len(test_games)),
         "games_skipped": int(skipped),
+        "failed_method_calls": int(failed_method_calls),
         "prediction_rows": int(len(pred_df)),
         "unique_games_completed": int(pred_df["game_id"].nunique()),
         "methods_present": sorted(pred_df["method"].dropna().unique().tolist()),
@@ -645,6 +770,7 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
     print(summary_df.to_string(index=False))
     print()
     print(f"Skipped games: {skipped}")
+    print(f"Failed method calls: {failed_method_calls}")
     print(f"Saved predictions to: {PREDICTIONS_OUT}")
     print(f"Saved summary to: {SUMMARY_OUT}")
     print(f"Saved calibration to: {CALIBRATION_OUT}")
