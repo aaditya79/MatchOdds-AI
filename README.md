@@ -257,7 +257,7 @@ praw
 - **Aaditya Pai** -- agent architecture, multi-agent debate, backtesting, evaluation
 - **Tanish Patel** -- Streamlit app, deployment, UI/report quality
 
-STAT GR5293 | Spring 2026 | Columbia University
+STAT GR5293: Generative AI Using LLMs | Spring 2026 | Columbia University
 
 ---
 
