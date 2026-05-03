@@ -40,6 +40,8 @@ from nba_agent import (
     parse_action,
     DATA_DIR,
     MAX_TOOL_OBSERVATION_CHARS,
+    empty_info_density,
+    merge_info_density,
 )
 
 
@@ -189,7 +191,14 @@ Start by calling get_odds for this game.""",
 }
 
 
-def run_single_agent(agent_key, game_description, llm_call_fn, extra_context="", max_steps=7):
+def run_single_agent(agent_key, game_description, llm_call_fn, extra_context="", max_steps=7,
+                     info_density=None):
+    """
+    Run one agent through its independent analysis phase.
+
+    If `info_density` is provided, tool result counts are accumulated into it
+    in place. Returns the agent's raw response text.
+    """
     agent = AGENTS[agent_key]
     print(f"\n{'='*50}")
     print(f"  {agent['name']}")
@@ -218,6 +227,8 @@ def run_single_agent(agent_key, game_description, llm_call_fn, extra_context="",
             if tool_name in agent["tools"]:
                 print(f"  Step {step+1}: {tool_name}({kwargs})")
                 result = agent["tools"][tool_name](**kwargs)
+                if info_density is not None:
+                    merge_info_density(info_density, tool_name, result)
                 if len(str(result)) > MAX_TOOL_OBSERVATION_CHARS:
                     result = str(result)[:MAX_TOOL_OBSERVATION_CHARS] + "\n... (truncated)"
                 print(f"    -> {str(result)[:120]}...")
@@ -282,7 +293,8 @@ def _format_other_agents_full_reasoning(agent_raw_responses, agent_analyses, exc
 
 
 def _run_agent_debate_turn(agent_key, game_description, context, llm_call_fn,
-                           max_tool_calls=MAX_DEBATE_TOOL_CALLS_PER_ROUND):
+                           max_tool_calls=MAX_DEBATE_TOOL_CALLS_PER_ROUND,
+                           info_density=None):
     """
     Run a single agent's debate turn with iterative tool use.
 
@@ -358,6 +370,8 @@ Other agents' positions:
             result = agent["tools"][tool_name](**kwargs)
         except Exception as e:
             result = f"Error calling {tool_name}: {e}"
+        if info_density is not None:
+            merge_info_density(info_density, tool_name, result)
         if len(str(result)) > MAX_TOOL_OBSERVATION_CHARS:
             result = str(result)[:MAX_TOOL_OBSERVATION_CHARS] + "\n... (truncated)"
 
@@ -392,7 +406,8 @@ def _check_convergence(agent_analyses, threshold=DEBATE_CONVERGENCE_THRESHOLD):
 
 def run_debate_round(game_description, agent_analyses, round_num, llm_call_fn,
                      agent_raw_responses=None,
-                     max_tool_calls=MAX_DEBATE_TOOL_CALLS_PER_ROUND):
+                     max_tool_calls=MAX_DEBATE_TOOL_CALLS_PER_ROUND,
+                     info_density=None):
     """
     Run one debate round. Each agent sees the OTHERS' full reasoning (raw
     text) and may make additional tool calls within its own tool restrictions.
@@ -424,6 +439,7 @@ def run_debate_round(game_description, agent_analyses, round_num, llm_call_fn,
         raw, analysis, tool_results = _run_agent_debate_turn(
             agent_key, game_description, context, llm_call_fn,
             max_tool_calls=max_tool_calls,
+            info_density=info_density,
         )
 
         updated_raw_responses[agent_key] = raw
@@ -543,6 +559,7 @@ def call_openai(messages):
 
 
 def run_full_debate(game_description, llm_call_fn, num_debate_rounds=DEFAULT_DEBATE_ROUNDS):
+    from nba_cost_logger import tally_calls
     """
     Run the full multi-agent debate.
 
@@ -570,51 +587,62 @@ def run_full_debate(game_description, llm_call_fn, num_debate_rounds=DEFAULT_DEB
     print(f"  PHASE 1: INDEPENDENT ANALYSIS")
     print(f"{'#'*60}")
 
-    agent_analyses = {}
-    agent_raw_responses = {}
+    info_density = empty_info_density()
 
-    for agent_key in AGENTS:
-        response = run_single_agent(agent_key, game_description, llm_call_fn)
-        agent_raw_responses[agent_key] = response
-        analysis = extract_analysis(response)
-        if analysis:
-            agent_analyses[agent_key] = analysis
-            pred = analysis.get("prediction", {})
-            print(f"  -> Prediction: Home {pred.get('home_win_prob', '?')} | Away {pred.get('away_win_prob', '?')}")
-        else:
-            agent_analyses[agent_key] = {"error": "Failed to parse analysis", "raw": response[:500]}
-            print(f"  -> Failed to parse analysis")
+    with tally_calls() as call_records:
+        agent_analyses = {}
+        agent_raw_responses = {}
 
-    debate_rounds_log = [{
-        "round": 0,
-        "phase": "independent_analysis",
-        "agent_analyses": json.loads(json.dumps(agent_analyses, default=str)),
-        "tool_calls": {},
-    }]
+        for agent_key in AGENTS:
+            response = run_single_agent(
+                agent_key, game_description, llm_call_fn,
+                info_density=info_density,
+            )
+            agent_raw_responses[agent_key] = response
+            analysis = extract_analysis(response)
+            if analysis:
+                agent_analyses[agent_key] = analysis
+                pred = analysis.get("prediction", {})
+                print(f"  -> Prediction: Home {pred.get('home_win_prob', '?')} | Away {pred.get('away_win_prob', '?')}")
+            else:
+                agent_analyses[agent_key] = {"error": "Failed to parse analysis", "raw": response[:500]}
+                print(f"  -> Failed to parse analysis")
 
-    converged = _check_convergence(agent_analyses)
-    rounds_executed = 0
-
-    for round_num in range(1, num_debate_rounds + 1):
-        if converged:
-            print(f"\n  Convergence reached after round {rounds_executed}; "
-                  f"skipping remaining rounds.")
-            break
-
-        agent_analyses, agent_raw_responses, round_tool_results = run_debate_round(
-            game_description, agent_analyses, round_num, llm_call_fn,
-            agent_raw_responses=agent_raw_responses,
-        )
-        rounds_executed = round_num
-        debate_rounds_log.append({
-            "round": round_num,
-            "phase": "debate",
+        debate_rounds_log = [{
+            "round": 0,
+            "phase": "independent_analysis",
             "agent_analyses": json.loads(json.dumps(agent_analyses, default=str)),
-            "tool_calls": round_tool_results,
-        })
-        converged = _check_convergence(agent_analyses)
+            "tool_calls": {},
+        }]
 
-    final_report = moderate(game_description, agent_analyses, llm_call_fn)
+        converged = _check_convergence(agent_analyses)
+        rounds_executed = 0
+
+        for round_num in range(1, num_debate_rounds + 1):
+            if converged:
+                print(f"\n  Convergence reached after round {rounds_executed}; "
+                      f"skipping remaining rounds.")
+                break
+
+            agent_analyses, agent_raw_responses, round_tool_results = run_debate_round(
+                game_description, agent_analyses, round_num, llm_call_fn,
+                agent_raw_responses=agent_raw_responses,
+                info_density=info_density,
+            )
+            rounds_executed = round_num
+            debate_rounds_log.append({
+                "round": round_num,
+                "phase": "debate",
+                "agent_analyses": json.loads(json.dumps(agent_analyses, default=str)),
+                "tool_calls": round_tool_results,
+            })
+            converged = _check_convergence(agent_analyses)
+
+        final_report = moderate(game_description, agent_analyses, llm_call_fn)
+
+        info_density["context_tokens"] = sum(
+            int(r.get("input_tokens", 0) or 0) for r in call_records
+        )
 
     return {
         "game": game_description,
@@ -624,6 +652,7 @@ def run_full_debate(game_description, llm_call_fn, num_debate_rounds=DEFAULT_DEB
         "rounds_executed": rounds_executed,
         "converged": converged,
         "debate_rounds": debate_rounds_log,
+        "info_density": info_density,
     }
 
 
