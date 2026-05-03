@@ -43,6 +43,27 @@ from nba_agent import (
 )
 
 
+# ============================================================
+# DEBATE CONFIG
+# ============================================================
+# Per Du et al. "Improving Factuality and Reasoning in Language Models through
+# Multiagent Debate" (2023): each agent should see the OTHER agents' full
+# reasoning each round, be able to gather more evidence between rounds, and
+# the loop should stop once positions converge.
+
+# Hard ceiling on debate rounds. Even if the env var asks for more, we cap.
+MAX_DEBATE_ROUNDS = 4
+
+# Default round count when caller does not specify.
+DEFAULT_DEBATE_ROUNDS = int(os.environ.get("NBA_DEBATE_ROUNDS", "2"))
+
+# Max additional tool calls an agent may make within a single debate round.
+MAX_DEBATE_TOOL_CALLS_PER_ROUND = int(os.environ.get("NBA_DEBATE_TOOL_CALLS_PER_ROUND", "3"))
+
+# Predictions across all agents within this absolute distance trigger early stop.
+DEBATE_CONVERGENCE_THRESHOLD = float(os.environ.get("NBA_DEBATE_CONVERGENCE", "0.05"))
+
+
 AGENTS = {
     "stats_agent": {
         "name": "Stats & Metrics Agent",
@@ -238,52 +259,176 @@ def extract_analysis(response_text):
     return None
 
 
-def run_debate_round(game_description, agent_analyses, round_num, llm_call_fn):
-    print(f"\n{'#'*60}")
-    print(f"  DEBATE ROUND {round_num}")
-    print(f"{'#'*60}")
+def _format_other_agents_full_reasoning(agent_raw_responses, agent_analyses, exclude_key):
+    """
+    Build the context block for one agent's debate turn.
 
-    updated_analyses = {}
+    Per Du et al., agents debate against each other's FULL reasoning, not just
+    their final probability. We pass the raw response text so the agent can
+    react to the actual argument, falling back to the parsed JSON if the raw
+    text is unavailable.
+    """
+    parts = []
+    for other_key, raw in agent_raw_responses.items():
+        if other_key == exclude_key:
+            continue
+        other_name = AGENTS[other_key]["name"]
+        if raw:
+            parts.append(f"=== {other_name} ===\n{raw}")
+        else:
+            analysis = agent_analyses.get(other_key, {})
+            parts.append(f"=== {other_name} (parsed) ===\n{json.dumps(analysis, indent=2)}")
+    return "\n\n".join(parts)
 
-    for agent_key in AGENTS:
-        other_analyses = []
-        for other_key, analysis in agent_analyses.items():
-            if other_key != agent_key:
-                other_name = AGENTS[other_key]["name"]
-                other_analyses.append(f"{other_name}:\n{json.dumps(analysis, indent=2)}")
 
-        context = "\n\n".join(other_analyses)
-        debate_prompt = f"""The other agents have shared their analyses. Review their arguments
-and update your position if warranted. You may agree, disagree, or adjust your prediction.
+def _run_agent_debate_turn(agent_key, game_description, context, llm_call_fn,
+                           max_tool_calls=MAX_DEBATE_TOOL_CALLS_PER_ROUND):
+    """
+    Run a single agent's debate turn with iterative tool use.
 
-If you want to gather more data to challenge their claims, you can call a tool first.
-Otherwise, provide your updated ANALYSIS directly.
+    The agent is shown the others' full reasoning and may make up to
+    `max_tool_calls` additional tool calls (within its own tool restrictions)
+    before producing its updated ANALYSIS. Returns (raw_response_text,
+    parsed_analysis_or_none, tool_results_list).
+    """
+    agent = AGENTS[agent_key]
+
+    debate_prompt = f"""The other agents have shared their full reasoning. Review their arguments
+critically. You may agree, disagree, or adjust your prediction.
+
+You may gather additional data with up to {max_tool_calls} more tool calls
+to challenge or confirm their claims. Use ACTION: tool_name(arg="value") to
+call a tool, then wait for the OBSERVATION before deciding what to do next.
+When you have enough information, produce your updated ANALYSIS in the same
+JSON format as before.
 
 Other agents' positions:
 {context}"""
 
+    messages = [
+        {"role": "system", "content": agent["system_prompt"]},
+        {"role": "user", "content": f"Game: {game_description}\n\n{debate_prompt}"},
+    ]
+
+    tool_results = []
+    response_text = ""
+
+    for tool_call_num in range(max_tool_calls + 1):
+        response_text = llm_call_fn(messages)
+
+        # If the agent produced its analysis, we are done with this turn.
+        if "ANALYSIS:" in response_text:
+            break
+
+        tool_name, kwargs, _ = parse_action(response_text)
+
+        if not tool_name:
+            # Nudge once for an analysis if no tool / no analysis.
+            messages.append({"role": "assistant", "content": response_text})
+            messages.append({
+                "role": "user",
+                "content": "Continue. Either call a tool with ACTION: ... or produce your updated ANALYSIS now."
+            })
+            continue
+
+        if tool_name not in agent["tools"]:
+            messages.append({"role": "assistant", "content": response_text})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"ERROR: You don't have access to {tool_name}. "
+                    f"Your tools are: {list(agent['tools'].keys())}. "
+                    "Either call an allowed tool or produce your updated ANALYSIS."
+                ),
+            })
+            print(f"    DENIED {tool_name} (not in this agent's tools)")
+            continue
+
+        if tool_call_num >= max_tool_calls:
+            # We have hit the budget: force final analysis on next turn.
+            messages.append({"role": "assistant", "content": response_text})
+            messages.append({
+                "role": "user",
+                "content": "Tool call budget exhausted. Produce your updated ANALYSIS now using the data already gathered."
+            })
+            continue
+
+        print(f"    Tool call: {tool_name}({kwargs})")
+        try:
+            result = agent["tools"][tool_name](**kwargs)
+        except Exception as e:
+            result = f"Error calling {tool_name}: {e}"
+        if len(str(result)) > MAX_TOOL_OBSERVATION_CHARS:
+            result = str(result)[:MAX_TOOL_OBSERVATION_CHARS] + "\n... (truncated)"
+
+        tool_results.append({"tool": tool_name, "args": kwargs, "result_preview": str(result)[:500]})
+        messages.append({"role": "assistant", "content": response_text})
+        messages.append({"role": "user", "content": f"OBSERVATION: {result}"})
+
+    analysis = extract_analysis(response_text)
+    return response_text, analysis, tool_results
+
+
+def _check_convergence(agent_analyses, threshold=DEBATE_CONVERGENCE_THRESHOLD):
+    """
+    Return True iff every agent's home_win_prob is within `threshold` of every
+    other agent's home_win_prob. Missing or unparsable predictions disqualify
+    convergence (we want to keep debating until we have real numbers).
+    """
+    probs = []
+    for analysis in agent_analyses.values():
+        if not isinstance(analysis, dict):
+            return False
+        pred = analysis.get("prediction", {})
+        try:
+            probs.append(float(pred.get("home_win_prob")))
+        except (TypeError, ValueError):
+            return False
+
+    if len(probs) < 2:
+        return False
+    return (max(probs) - min(probs)) <= threshold
+
+
+def run_debate_round(game_description, agent_analyses, round_num, llm_call_fn,
+                     agent_raw_responses=None,
+                     max_tool_calls=MAX_DEBATE_TOOL_CALLS_PER_ROUND):
+    """
+    Run one debate round. Each agent sees the OTHERS' full reasoning (raw
+    text) and may make additional tool calls within its own tool restrictions.
+
+    Returns (updated_analyses, updated_raw_responses, per_agent_tool_results).
+
+    Backward-compat: callers that pass only the legacy positional args still
+    get a working updated_analyses dict.
+    """
+    print(f"\n{'#'*60}")
+    print(f"  DEBATE ROUND {round_num}")
+    print(f"{'#'*60}")
+
+    if agent_raw_responses is None:
+        agent_raw_responses = {}
+
+    updated_analyses = {}
+    updated_raw_responses = {}
+    per_agent_tool_results = {}
+
+    for agent_key in AGENTS:
         agent = AGENTS[agent_key]
-        messages = [
-            {"role": "system", "content": agent["system_prompt"]},
-            {"role": "user", "content": f"Game: {game_description}\n\n{debate_prompt}"},
-        ]
+        context = _format_other_agents_full_reasoning(
+            agent_raw_responses, agent_analyses, exclude_key=agent_key
+        )
 
         print(f"\n  {agent['name']} responding to debate...")
 
-        response_text = llm_call_fn(messages)
+        raw, analysis, tool_results = _run_agent_debate_turn(
+            agent_key, game_description, context, llm_call_fn,
+            max_tool_calls=max_tool_calls,
+        )
 
-        tool_name, kwargs, _ = parse_action(response_text)
-        if tool_name and tool_name in agent["tools"]:
-            print(f"    Tool call: {tool_name}({kwargs})")
-            result = agent["tools"][tool_name](**kwargs)
-            if len(str(result)) > 2000:
-                result = str(result)[:2000] + "\n... (truncated)"
+        updated_raw_responses[agent_key] = raw
+        per_agent_tool_results[agent_key] = tool_results
 
-            messages.append({"role": "assistant", "content": response_text})
-            messages.append({"role": "user", "content": f"OBSERVATION: {result}\n\nNow provide your updated ANALYSIS."})
-            response_text = llm_call_fn(messages)
-
-        analysis = extract_analysis(response_text)
         if analysis:
             updated_analyses[agent_key] = analysis
             pred = analysis.get("prediction", {})
@@ -292,7 +437,7 @@ Other agents' positions:
             updated_analyses[agent_key] = agent_analyses.get(agent_key, {})
             print(f"    Kept previous position (parse failed)")
 
-    return updated_analyses
+    return updated_analyses, updated_raw_responses, per_agent_tool_results
 
 
 def moderate(game_description, agent_analyses, llm_call_fn):
@@ -397,10 +542,29 @@ def call_openai(messages):
     return response.choices[0].message.content
 
 
-def run_full_debate(game_description, llm_call_fn, num_debate_rounds=2):
+def run_full_debate(game_description, llm_call_fn, num_debate_rounds=DEFAULT_DEBATE_ROUNDS):
+    """
+    Run the full multi-agent debate.
+
+    Phase 1: each agent independently analyses with its own tool budget.
+    Phase 2: up to `num_debate_rounds` debate rounds (capped at MAX_DEBATE_ROUNDS).
+             Each round shows agents the OTHERS' full reasoning and lets them
+             call additional tools. We stop early once predictions converge
+             (all home_win_prob within DEBATE_CONVERGENCE_THRESHOLD).
+    Phase 3: moderator synthesises into a final report.
+
+    Returns (backward-compatible additions only):
+        game, agent_analyses, final_report, num_debate_rounds,
+        debate_rounds        -> list of per-round snapshots
+        converged            -> bool, whether early stop fired
+        rounds_executed      -> int, actual rounds run (<= num_debate_rounds)
+    """
     print("=" * 60)
     print(f"MULTI-AGENT DEBATE: {game_description}")
     print("=" * 60)
+
+    # Cap aggressively to protect spend.
+    num_debate_rounds = max(0, min(int(num_debate_rounds), MAX_DEBATE_ROUNDS))
 
     print(f"\n{'#'*60}")
     print(f"  PHASE 1: INDEPENDENT ANALYSIS")
@@ -421,8 +585,34 @@ def run_full_debate(game_description, llm_call_fn, num_debate_rounds=2):
             agent_analyses[agent_key] = {"error": "Failed to parse analysis", "raw": response[:500]}
             print(f"  -> Failed to parse analysis")
 
+    debate_rounds_log = [{
+        "round": 0,
+        "phase": "independent_analysis",
+        "agent_analyses": json.loads(json.dumps(agent_analyses, default=str)),
+        "tool_calls": {},
+    }]
+
+    converged = _check_convergence(agent_analyses)
+    rounds_executed = 0
+
     for round_num in range(1, num_debate_rounds + 1):
-        agent_analyses = run_debate_round(game_description, agent_analyses, round_num, llm_call_fn)
+        if converged:
+            print(f"\n  Convergence reached after round {rounds_executed}; "
+                  f"skipping remaining rounds.")
+            break
+
+        agent_analyses, agent_raw_responses, round_tool_results = run_debate_round(
+            game_description, agent_analyses, round_num, llm_call_fn,
+            agent_raw_responses=agent_raw_responses,
+        )
+        rounds_executed = round_num
+        debate_rounds_log.append({
+            "round": round_num,
+            "phase": "debate",
+            "agent_analyses": json.loads(json.dumps(agent_analyses, default=str)),
+            "tool_calls": round_tool_results,
+        })
+        converged = _check_convergence(agent_analyses)
 
     final_report = moderate(game_description, agent_analyses, llm_call_fn)
 
@@ -431,6 +621,9 @@ def run_full_debate(game_description, llm_call_fn, num_debate_rounds=2):
         "agent_analyses": agent_analyses,
         "final_report": final_report,
         "num_debate_rounds": num_debate_rounds,
+        "rounds_executed": rounds_executed,
+        "converged": converged,
+        "debate_rounds": debate_rounds_log,
     }
 
 
@@ -465,6 +658,9 @@ def main():
         "agent_analyses": result["agent_analyses"],
         "final_report": result["final_report"],
         "num_debate_rounds": result["num_debate_rounds"],
+        "rounds_executed": result.get("rounds_executed"),
+        "converged": result.get("converged"),
+        "debate_rounds": result.get("debate_rounds", []),
         "timestamp": datetime.now().isoformat(),
     }
     with open(log_path, "w") as f:
