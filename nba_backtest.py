@@ -16,6 +16,7 @@ Outputs:
     data/backtest_cache/*.json
 """
 
+import contextlib
 import os
 import json
 import math
@@ -34,6 +35,106 @@ RUN_META_OUT = f"{DATA_DIR}/backtest_run_metadata.json"
 CACHE_DIR = f"{DATA_DIR}/backtest_cache"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+# ============================================================
+# ABLATION CONFIG
+# ============================================================
+# Each name maps a single data source on the project to (a) the tool functions
+# in nba_agent that should be replaced with a "DISABLED" marker and (b) the
+# snapshot keys that should be scrubbed when feeding the static-prompt
+# backtest. Wave 2 agents will exercise the tool monkeypatch path; today's
+# static-prompt backtest also benefits from the snapshot scrub.
+ABLATION_SOURCES = {
+    "youtube":      {"tools": ["tool_get_team_sentiment"], "snapshot_keys": []},
+    "news":         {"tools": ["tool_get_team_sentiment"], "snapshot_keys": []},
+    "odds":         {"tools": ["tool_get_odds"],            "snapshot_keys": []},
+    "injuries":     {"tools": ["tool_get_injuries"],        "snapshot_keys": []},
+    "vector_store": {"tools": ["tool_search_similar_games"],"snapshot_keys": []},
+    "h2h":          {"tools": ["tool_get_head_to_head"],    "snapshot_keys": ["head_to_head"]},
+    "stats":        {"tools": ["tool_get_team_stats"],
+                     "snapshot_keys": ["home_team_stats", "away_team_stats"]},
+}
+
+
+def _disabled_tool_factory(source_name):
+    """Return a tool replacement that emits a stable DISABLED marker."""
+    msg = f"DISABLED for ablation: {source_name}"
+
+    def _disabled(*args, **kwargs):
+        return msg
+
+    _disabled.__name__ = f"disabled_{source_name}"
+    return _disabled
+
+
+@contextlib.contextmanager
+def ablate_source(source_name):
+    """
+    Disable one data source for the duration of the `with` block.
+
+    Monkeypatches the relevant tool functions on the nba_agent module so the
+    multi-agent / single-agent / cot runners that import those tools see the
+    DISABLED marker instead of real data. Restores the originals on exit even
+    if the body raises.
+
+    Pass source_name=None or "" to no-op (clean baseline run).
+    """
+    if not source_name:
+        yield
+        return
+
+    if source_name not in ABLATION_SOURCES:
+        raise ValueError(
+            f"Unknown ablation source: {source_name!r}. "
+            f"Choose one of: {sorted(ABLATION_SOURCES)}"
+        )
+
+    import nba_agent
+    spec = ABLATION_SOURCES[source_name]
+    originals = {}
+    try:
+        for tool_attr in spec["tools"]:
+            if hasattr(nba_agent, tool_attr):
+                originals[tool_attr] = getattr(nba_agent, tool_attr)
+                setattr(nba_agent, tool_attr, _disabled_tool_factory(source_name))
+            # Also patch the entry inside the TOOLS registry so call_tool
+            # dispatches to the disabled stub.
+        if hasattr(nba_agent, "TOOLS"):
+            for short_name, info in nba_agent.TOOLS.items():
+                fn_attr = "tool_" + short_name
+                if fn_attr in originals:
+                    info["function"] = getattr(nba_agent, fn_attr)
+        yield
+    finally:
+        for tool_attr, fn in originals.items():
+            setattr(nba_agent, tool_attr, fn)
+        if hasattr(nba_agent, "TOOLS"):
+            for short_name, info in nba_agent.TOOLS.items():
+                fn_attr = "tool_" + short_name
+                if fn_attr in originals:
+                    info["function"] = originals[fn_attr]
+
+
+def scrub_snapshot_for_ablation(snapshot, source_name):
+    """
+    Return a copy of `snapshot` with the keys belonging to the ablated source
+    replaced by the DISABLED marker. The static-prompt backtest builds
+    snapshots without going through the tool layer, so the monkeypatch alone
+    would not change its outputs; this hook makes ablation visible there too.
+    """
+    if not source_name:
+        return snapshot
+    spec = ABLATION_SOURCES.get(source_name)
+    if not spec:
+        return snapshot
+
+    scrubbed = json.loads(json.dumps(snapshot, default=str))
+    marker = f"DISABLED for ablation: {source_name}"
+    for key in spec["snapshot_keys"]:
+        if key in scrubbed:
+            scrubbed[key] = marker
+    return scrubbed
 
 DEFAULT_N_GAMES = 30
 DEFAULT_MIN_GAMES_HISTORY = 10
@@ -344,29 +445,32 @@ def parse_json_response(text):
 # CACHE + RETRY
 # ============================================================
 
-def get_cache_path(snapshot, method_name):
+def get_cache_path(snapshot, method_name, ablation=None):
     game = snapshot["game"]
-    filename = f"{game['season']}_{game['date']}_{game['away_team']}_at_{game['home_team']}_{method_name}.json"
+    suffix = f"_ablate_{ablation}" if ablation else ""
+    filename = f"{game['season']}_{game['date']}_{game['away_team']}_at_{game['home_team']}_{method_name}{suffix}.json"
     filename = filename.replace(" ", "_").replace("/", "-")
     return os.path.join(CACHE_DIR, filename)
 
 
-def load_cached_result(snapshot, method_name):
-    path = get_cache_path(snapshot, method_name)
+def load_cached_result(snapshot, method_name, ablation=None):
+    path = get_cache_path(snapshot, method_name, ablation=ablation)
     if os.path.exists(path):
         with open(path, "r") as f:
             return json.load(f)
     return None
 
 
-def save_cached_result(snapshot, method_name, parsed, raw, info_density=None):
-    path = get_cache_path(snapshot, method_name)
+def save_cached_result(snapshot, method_name, parsed, raw, info_density=None, ablation=None):
+    path = get_cache_path(snapshot, method_name, ablation=ablation)
     payload = {
         "parsed": parsed,
         "raw": raw,
     }
     if info_density is not None:
         payload["info_density"] = info_density
+    if ablation:
+        payload["ablation"] = ablation
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
 
@@ -688,11 +792,26 @@ def match_market_prob(odds_df, game_date, home_team, away_team):
 # MAIN
 # ============================================================
 
-def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, min_games_history=DEFAULT_MIN_GAMES_HISTORY):
+def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER,
+                 min_games_history=DEFAULT_MIN_GAMES_HISTORY, disable_source=None):
+    """
+    Run the historical backtest.
+
+    Args:
+        n_games: number of games to sample from the season filter.
+        season_filter: e.g. "2025-26" or None for all.
+        min_games_history: skip games where either team has fewer than this many
+            prior games in the same season.
+        disable_source: if set, run with that source ablated. The corresponding
+            tools in nba_agent emit "DISABLED for ablation: <name>" and the
+            relevant snapshot keys are scrubbed. Output goes to
+            data/backtest_ablation_<name>.csv (and a matching summary file)
+            instead of the default backtest_predictions.csv.
+    """
     llm_fn, llm_name = get_llm_fn()
 
     print("=" * 60)
-    print("NBA Historical Backtest")
+    print("NBA Historical Backtest" + (f" [ABLATE {disable_source}]" if disable_source else ""))
     print("=" * 60)
     print(f"Using model backend: {llm_name}")
 
@@ -707,91 +826,100 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
     skipped = 0
     failed_method_calls = 0
 
-    for i, (_, game_row) in enumerate(test_games.iterrows(), start=1):
-        snapshot = build_historical_snapshot(game_logs, game_row, min_games_history=min_games_history)
-        if snapshot is None:
-            skipped += 1
-            continue
+    with ablate_source(disable_source):
+        for i, (_, game_row) in enumerate(test_games.iterrows(), start=1):
+            raw_snapshot = build_historical_snapshot(game_logs, game_row, min_games_history=min_games_history)
+            if raw_snapshot is None:
+                skipped += 1
+                continue
 
-        game_label = f"{snapshot['game']['away_team']} @ {snapshot['game']['home_team']} on {snapshot['game']['date']}"
-        actual_home_win = int(game_row["HOME_WIN"])
+            snapshot = scrub_snapshot_for_ablation(raw_snapshot, disable_source)
 
-        market_match = match_market_prob(
-            odds_hist,
-            snapshot["game"]["date"],
-            snapshot["game"]["home_team"],
-            snapshot["game"]["away_team"],
-        )
+            game_label = f"{snapshot['game']['away_team']} @ {snapshot['game']['home_team']} on {snapshot['game']['date']}"
+            actual_home_win = int(game_row["HOME_WIN"])
 
-        market_home_implied_prob = None
-        market_away_implied_prob = None
-        if market_match:
-            market_home_implied_prob = market_match["home_implied_prob"]
-            market_away_implied_prob = market_match["away_implied_prob"]
+            # Market odds are the answer key; do NOT ablate them away from the
+            # CSV (we still need to compare predictions against the line).
+            market_match = match_market_prob(
+                odds_hist,
+                snapshot["game"]["date"],
+                snapshot["game"]["home_team"],
+                snapshot["game"]["away_team"],
+            )
 
-        print()
-        print(f"[{i}/{len(test_games)}] {game_label}")
+            market_home_implied_prob = None
+            market_away_implied_prob = None
+            if market_match:
+                market_home_implied_prob = market_match["home_implied_prob"]
+                market_away_implied_prob = market_match["away_implied_prob"]
 
-        model_runs = [
-            ("single_agent", run_single_agent_backtest),
-            ("chain_of_thought", run_cot_backtest),
-            ("multi_agent_debate", run_multi_agent_backtest),
-        ]
+            print()
+            print(f"[{i}/{len(test_games)}] {game_label}")
 
-        for method_name, runner in model_runs:
-            try:
-                cached = load_cached_result(snapshot, method_name)
-                if cached is not None:
-                    parsed = cached["parsed"]
-                    raw = cached["raw"]
-                    info_density = cached.get("info_density") or _empty_backtest_info_density()
-                    print(f"  {method_name}: loaded from cache")
-                else:
-                    parsed, raw, info_density = run_with_retry(lambda: runner(snapshot, llm_fn))
-                    save_cached_result(snapshot, method_name, parsed, raw, info_density=info_density)
+            model_runs = [
+                ("single_agent", run_single_agent_backtest),
+                ("chain_of_thought", run_cot_backtest),
+                ("multi_agent_debate", run_multi_agent_backtest),
+            ]
 
-                home_prob = safe_clip_prob(parsed["home_win_prob"])
-                away_prob = safe_clip_prob(parsed["away_win_prob"])
+            for method_name, runner in model_runs:
+                try:
+                    cached = load_cached_result(snapshot, method_name, ablation=disable_source)
+                    if cached is not None:
+                        parsed = cached["parsed"]
+                        raw = cached["raw"]
+                        info_density = cached.get("info_density") or _empty_backtest_info_density()
+                        print(f"  {method_name}: loaded from cache")
+                    else:
+                        parsed, raw, info_density = run_with_retry(lambda: runner(snapshot, llm_fn))
+                        save_cached_result(
+                            snapshot, method_name, parsed, raw,
+                            info_density=info_density, ablation=disable_source,
+                        )
 
-                if abs((home_prob + away_prob) - 1.0) > 0.05:
-                    total = home_prob + away_prob
-                    home_prob = home_prob / total
-                    away_prob = away_prob / total
+                    home_prob = safe_clip_prob(parsed["home_win_prob"])
+                    away_prob = safe_clip_prob(parsed["away_win_prob"])
 
-                pred_home_win = int(home_prob >= away_prob)
+                    if abs((home_prob + away_prob) - 1.0) > 0.05:
+                        total = home_prob + away_prob
+                        home_prob = home_prob / total
+                        away_prob = away_prob / total
 
-                rows.append({
-                    "game_id": game_row["GAME_ID"],
-                    "date": snapshot["game"]["date"],
-                    "season": snapshot["game"]["season"],
-                    "home_team": snapshot["game"]["home_team"],
-                    "away_team": snapshot["game"]["away_team"],
-                    "method": method_name,
-                    "home_win_prob": round(home_prob, 6),
-                    "away_win_prob": round(away_prob, 6),
-                    "pred_home_win": pred_home_win,
-                    "actual_home_win": actual_home_win,
-                    "correct": int(pred_home_win == actual_home_win),
-                    "log_loss": round(compute_log_loss(actual_home_win, home_prob), 6),
-                    "brier_score": round(compute_brier(actual_home_win, home_prob), 6),
-                    "confidence": parsed.get("confidence", ""),
-                    "key_factors": json.dumps(parsed.get("key_factors", [])),
-                    "reasoning": parsed.get("reasoning", ""),
-                    "market_home_implied_prob": market_home_implied_prob,
-                    "market_away_implied_prob": market_away_implied_prob,
-                    "info_density_youtube_comments": int(info_density.get("youtube_comments", 0) or 0),
-                    "info_density_news_articles": int(info_density.get("news_articles", 0) or 0),
-                    "info_density_vector_hits": int(info_density.get("vector_hits", 0) or 0),
-                    "info_density_context_tokens": int(info_density.get("context_tokens", 0) or 0),
-                    "raw_response": raw,
-                })
+                    pred_home_win = int(home_prob >= away_prob)
 
-                print(f"  {method_name}: home={home_prob:.3f}, away={away_prob:.3f}, correct={pred_home_win == actual_home_win}")
-                time.sleep(SLEEP_BETWEEN_CALLS)
+                    rows.append({
+                        "game_id": game_row["GAME_ID"],
+                        "date": snapshot["game"]["date"],
+                        "season": snapshot["game"]["season"],
+                        "home_team": snapshot["game"]["home_team"],
+                        "away_team": snapshot["game"]["away_team"],
+                        "method": method_name,
+                        "ablation": disable_source or "",
+                        "home_win_prob": round(home_prob, 6),
+                        "away_win_prob": round(away_prob, 6),
+                        "pred_home_win": pred_home_win,
+                        "actual_home_win": actual_home_win,
+                        "correct": int(pred_home_win == actual_home_win),
+                        "log_loss": round(compute_log_loss(actual_home_win, home_prob), 6),
+                        "brier_score": round(compute_brier(actual_home_win, home_prob), 6),
+                        "confidence": parsed.get("confidence", ""),
+                        "key_factors": json.dumps(parsed.get("key_factors", [])),
+                        "reasoning": parsed.get("reasoning", ""),
+                        "market_home_implied_prob": market_home_implied_prob,
+                        "market_away_implied_prob": market_away_implied_prob,
+                        "info_density_youtube_comments": int(info_density.get("youtube_comments", 0) or 0),
+                        "info_density_news_articles": int(info_density.get("news_articles", 0) or 0),
+                        "info_density_vector_hits": int(info_density.get("vector_hits", 0) or 0),
+                        "info_density_context_tokens": int(info_density.get("context_tokens", 0) or 0),
+                        "raw_response": raw,
+                    })
 
-            except Exception as e:
-                failed_method_calls += 1
-                print(f"  {method_name}: FAILED -> {e}")
+                    print(f"  {method_name}: home={home_prob:.3f}, away={away_prob:.3f}, correct={pred_home_win == actual_home_win}")
+                    time.sleep(SLEEP_BETWEEN_CALLS)
+
+                except Exception as e:
+                    failed_method_calls += 1
+                    print(f"  {method_name}: FAILED -> {e}")
 
     if not rows:
         raise RuntimeError("No predictions were produced.")
@@ -800,14 +928,26 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
     summary_df = summarize_metrics(pred_df)
     calibration_df = build_calibration_table(pred_df, n_bins=5)
 
-    pred_df.to_csv(PREDICTIONS_OUT, index=False)
-    summary_df.to_csv(SUMMARY_OUT, index=False)
-    calibration_df.to_csv(CALIBRATION_OUT, index=False)
+    if disable_source:
+        predictions_out = f"{DATA_DIR}/backtest_ablation_{disable_source}.csv"
+        summary_out = f"{DATA_DIR}/backtest_ablation_{disable_source}_summary.csv"
+        calibration_out = f"{DATA_DIR}/backtest_ablation_{disable_source}_calibration.csv"
+        run_meta_out = f"{DATA_DIR}/backtest_ablation_{disable_source}_metadata.json"
+    else:
+        predictions_out = PREDICTIONS_OUT
+        summary_out = SUMMARY_OUT
+        calibration_out = CALIBRATION_OUT
+        run_meta_out = RUN_META_OUT
+
+    pred_df.to_csv(predictions_out, index=False)
+    summary_df.to_csv(summary_out, index=False)
+    calibration_df.to_csv(calibration_out, index=False)
 
     run_meta = {
         "n_games_requested": int(n_games),
         "season_filter": season_filter,
         "min_games_history": int(min_games_history),
+        "ablation": disable_source or "",
         "candidate_games_selected": int(len(test_games)),
         "games_skipped": int(skipped),
         "failed_method_calls": int(failed_method_calls),
@@ -816,21 +956,21 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
         "methods_present": sorted(pred_df["method"].dropna().unique().tolist()),
     }
 
-    with open(RUN_META_OUT, "w") as f:
+    with open(run_meta_out, "w") as f:
         json.dump(run_meta, f, indent=2)
 
     print()
     print("=" * 60)
-    print("BACKTEST SUMMARY")
+    print("BACKTEST SUMMARY" + (f" [ABLATE {disable_source}]" if disable_source else ""))
     print("=" * 60)
     print(summary_df.to_string(index=False))
     print()
     print(f"Skipped games: {skipped}")
     print(f"Failed method calls: {failed_method_calls}")
-    print(f"Saved predictions to: {PREDICTIONS_OUT}")
-    print(f"Saved summary to: {SUMMARY_OUT}")
-    print(f"Saved calibration to: {CALIBRATION_OUT}")
-    print(f"Saved run metadata to: {RUN_META_OUT}")
+    print(f"Saved predictions to: {predictions_out}")
+    print(f"Saved summary to: {summary_out}")
+    print(f"Saved calibration to: {calibration_out}")
+    print(f"Saved run metadata to: {run_meta_out}")
 
 
 def main():
@@ -838,12 +978,38 @@ def main():
     parser.add_argument("--n-games", type=int, default=DEFAULT_N_GAMES)
     parser.add_argument("--season", type=str, default=DEFAULT_SEASON_FILTER)
     parser.add_argument("--min-games-history", type=int, default=DEFAULT_MIN_GAMES_HISTORY)
+    parser.add_argument(
+        "--disable-source", type=str, default=None,
+        choices=sorted(ABLATION_SOURCES.keys()),
+        help="Disable one data source for the run; output goes to data/backtest_ablation_<name>.csv.",
+    )
+    parser.add_argument(
+        "--ablate-all", action="store_true",
+        help="Run a baseline + one backtest per source sequentially. Mutually exclusive with --disable-source.",
+    )
     args = parser.parse_args()
+
+    if args.ablate_all and args.disable_source:
+        parser.error("--ablate-all and --disable-source are mutually exclusive.")
+
+    if args.ablate_all:
+        sources = sorted(ABLATION_SOURCES.keys())
+        print(f"=== ABLATE-ALL: running {len(sources)} ablation backtests ===")
+        for source in sources:
+            print(f"\n\n##### Ablation: {source} #####")
+            run_backtest(
+                n_games=args.n_games,
+                season_filter=args.season,
+                min_games_history=args.min_games_history,
+                disable_source=source,
+            )
+        return
 
     run_backtest(
         n_games=args.n_games,
         season_filter=args.season,
         min_games_history=args.min_games_history,
+        disable_source=args.disable_source,
     )
 
 
