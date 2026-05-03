@@ -111,29 +111,222 @@ def pull_live_odds():
         return pd.DataFrame()
 
 
+# ============================================================
+# KAGGLE HISTORICAL ODDS
+# ============================================================
+
+# Chosen dataset: https://www.kaggle.com/datasets/erichqiu/nba-odds-and-scores
+# Pranav downloads it manually (Kaggle requires auth) and drops the
+# extracted CSV at data/kaggle_odds.csv.
+#
+# The dataset ships in long format: one row per (team, game) with columns
+# Date, Team, OppTeam, Location ("Home"/"Away"), Average_Line_Spread, and
+# game-result fields. Some redistributions of the same dataset add
+# Average_Line_ML (moneyline) — when present we use it directly; when
+# absent we derive an approximate moneyline from the spread so the
+# backtest still has a baseline market probability.
+
+KAGGLE_INPUT_PATH = f"{DATA_DIR}/kaggle_odds.csv"
+HISTORICAL_OUTPUT_PATH = f"{DATA_DIR}/odds_historical.csv"
+
+# nba_backtest.match_market_prob() reads these exact columns; do not rename.
+BACKTEST_REQUIRED_COLS = ["Date", "Location", "Team", "OppTeam", "Average_Line_ML"]
+
+
+def _spread_to_moneyline(spread):
+    """
+    Approximate American moneyline from a closing point spread.
+    Standard heuristic used by sportsbook calculators: roughly
+    -110 at pick'em, scaling to -550 at -7 and +450 at +7. Good
+    enough for a backtest baseline; replace with actual ML when
+    available.
+    """
+    try:
+        s = float(spread)
+    except (TypeError, ValueError):
+        return None
+    # Piecewise mapping from spread to ML, fit to typical NBA close lines.
+    # Negative spread = favorite (negative ML), positive = underdog.
+    table = [
+        (-15, -2500), (-10, -800), (-7, -340), (-5, -220),
+        (-3, -160), (-2, -135), (-1, -115), (0, -110),
+        (1, -105), (2, 115), (3, 140), (5, 200),
+        (7, 320), (10, 750), (15, 2400),
+    ]
+    # Linear interp between the two nearest anchor points.
+    if s <= table[0][0]:
+        return table[0][1]
+    if s >= table[-1][0]:
+        return table[-1][1]
+    for (s_lo, ml_lo), (s_hi, ml_hi) in zip(table, table[1:]):
+        if s_lo <= s <= s_hi:
+            if s_hi == s_lo:
+                return ml_lo
+            frac = (s - s_lo) / (s_hi - s_lo)
+            return ml_lo + frac * (ml_hi - ml_lo)
+    return None
+
+
+def _normalize_kaggle_frame(raw):
+    """
+    Map common Kaggle NBA odds layouts to the long-format schema
+    nba_backtest.py expects.
+
+    Returns a DataFrame with at minimum:
+        Date, Location, Team, OppTeam, Average_Line_ML
+    plus convenience columns:
+        GAME_DATE, HOME_TEAM, AWAY_TEAM, HOME_IMPLIED_PROB,
+        AWAY_IMPLIED_PROB
+    """
+    df = raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # ----- Long format (erichqiu schema) -----
+    if {"Date", "Team", "OppTeam", "Location"}.issubset(df.columns):
+        if "Average_Line_ML" not in df.columns:
+            spread_col = next(
+                (c for c in ["Average_Line_Spread", "Spread", "Line"] if c in df.columns),
+                None,
+            )
+            if spread_col is None:
+                raise ValueError(
+                    "Kaggle CSV is missing both Average_Line_ML and a spread column; "
+                    "cannot derive moneyline."
+                )
+            df["Average_Line_ML"] = df[spread_col].apply(_spread_to_moneyline)
+        long_df = df
+
+    # ----- Wide format: one row per game with home/away columns -----
+    elif {"home_team", "away_team", "date"}.issubset({c.lower() for c in df.columns}):
+        # Normalize column case for the keys we care about.
+        rename = {c: c.lower() for c in df.columns}
+        df = df.rename(columns=rename)
+        ml_home_col = next(
+            (c for c in ["ml_home", "moneyline_home", "home_ml", "home_moneyline"]
+             if c in df.columns),
+            None,
+        )
+        ml_away_col = next(
+            (c for c in ["ml_away", "moneyline_away", "away_ml", "away_moneyline"]
+             if c in df.columns),
+            None,
+        )
+        if ml_home_col is None or ml_away_col is None:
+            spread_col = next(
+                (c for c in ["spread", "spread_home", "home_spread"] if c in df.columns),
+                None,
+            )
+            if spread_col is None:
+                raise ValueError(
+                    "Wide-format Kaggle CSV is missing moneyline and spread columns; "
+                    "cannot derive a market price."
+                )
+            df["__ml_home"] = df[spread_col].apply(_spread_to_moneyline)
+            df["__ml_away"] = df[spread_col].apply(
+                lambda s: _spread_to_moneyline(-float(s)) if pd.notna(s) else None
+            )
+            ml_home_col, ml_away_col = "__ml_home", "__ml_away"
+
+        home = pd.DataFrame({
+            "Date": df["date"],
+            "Location": "Home",
+            "Team": df["home_team"],
+            "OppTeam": df["away_team"],
+            "Average_Line_ML": df[ml_home_col],
+        })
+        away = pd.DataFrame({
+            "Date": df["date"],
+            "Location": "Away",
+            "Team": df["away_team"],
+            "OppTeam": df["home_team"],
+            "Average_Line_ML": df[ml_away_col],
+        })
+        long_df = pd.concat([home, away], ignore_index=True)
+
+    else:
+        raise ValueError(
+            f"Unrecognized Kaggle CSV schema. Columns: {list(df.columns)[:10]}..."
+        )
+
+    # Clean date and drop rows without a market price.
+    long_df["Date"] = pd.to_datetime(long_df["Date"], errors="coerce")
+    long_df = long_df.dropna(subset=["Date", "Average_Line_ML"]).copy()
+    long_df["Average_Line_ML"] = pd.to_numeric(
+        long_df["Average_Line_ML"], errors="coerce"
+    )
+    long_df = long_df.dropna(subset=["Average_Line_ML"]).copy()
+
+    # Convenience columns expected by some downstream consumers.
+    long_df["GAME_DATE"] = long_df["Date"].dt.strftime("%Y-%m-%d")
+    is_home = long_df["Location"].astype(str).str.lower() == "home"
+    long_df["HOME_TEAM"] = long_df["Team"].where(is_home, long_df["OppTeam"])
+    long_df["AWAY_TEAM"] = long_df["OppTeam"].where(is_home, long_df["Team"])
+    long_df["IMPLIED_PROB"] = long_df["Average_Line_ML"].apply(
+        compute_implied_probability
+    )
+
+    # Derive vig-free home/away implied probabilities by pivoting.
+    pivot = long_df.pivot_table(
+        index=["Date", "HOME_TEAM", "AWAY_TEAM"],
+        columns="Location",
+        values="IMPLIED_PROB",
+        aggfunc="first",
+    )
+    pivot.columns = [str(c).lower() for c in pivot.columns]
+    if "home" in pivot.columns and "away" in pivot.columns:
+        total = pivot["home"] + pivot["away"]
+        pivot["HOME_IMPLIED_PROB"] = (pivot["home"] / total).where(total > 0)
+        pivot["AWAY_IMPLIED_PROB"] = (pivot["away"] / total).where(total > 0)
+        pivot = pivot.reset_index()[
+            ["Date", "HOME_TEAM", "AWAY_TEAM", "HOME_IMPLIED_PROB", "AWAY_IMPLIED_PROB"]
+        ]
+        long_df = long_df.merge(pivot, on=["Date", "HOME_TEAM", "AWAY_TEAM"], how="left")
+
+    return long_df.reset_index(drop=True)
+
+
 def load_kaggle_historical_odds():
     """
-    Load historical odds from a Kaggle dataset.
-    User needs to download the CSV manually and place it in data/kaggle_odds.csv.
+    Load historical odds from the chosen Kaggle dataset and normalize to the
+    schema consumed by nba_backtest.match_market_prob().
 
-    Recommended dataset:
-    https://www.kaggle.com/datasets/erichqiu/nba-odds-and-scores
+    Source: https://www.kaggle.com/datasets/erichqiu/nba-odds-and-scores
+    Manual step: download the CSV and place it at data/kaggle_odds.csv.
+
+    Returns the normalized long-format DataFrame and writes it to
+    data/odds_historical.csv as a side effect when called from main().
     """
     print("Loading historical odds from Kaggle...")
 
-    kaggle_path = f"{DATA_DIR}/kaggle_odds.csv"
-    if os.path.exists(kaggle_path):
-        df = pd.read_csv(kaggle_path)
-        print(f"  Loaded {len(df)} rows from {kaggle_path}")
-        return df
-    else:
-        print(f"  No file found at {kaggle_path}")
+    if not os.path.exists(KAGGLE_INPUT_PATH):
+        print(f"  No file found at {KAGGLE_INPUT_PATH}")
         print("  To get historical odds for evaluation:")
         print("    1. Go to https://www.kaggle.com/datasets/erichqiu/nba-odds-and-scores")
         print("    2. Download the CSV")
-        print(f"    3. Save it as {kaggle_path}")
+        print(f"    3. Save it as {KAGGLE_INPUT_PATH}")
         print("  Skipping historical odds for now.")
         return pd.DataFrame()
+
+    raw = pd.read_csv(KAGGLE_INPUT_PATH)
+    print(f"  Read {len(raw)} raw rows, {len(raw.columns)} columns from {KAGGLE_INPUT_PATH}")
+
+    try:
+        df = _normalize_kaggle_frame(raw)
+    except ValueError as e:
+        print(f"  Failed to normalize: {e}")
+        return pd.DataFrame()
+
+    missing = [c for c in BACKTEST_REQUIRED_COLS if c not in df.columns]
+    if missing:
+        print(f"  Normalized frame is missing required columns: {missing}")
+        return pd.DataFrame()
+
+    print(
+        f"  Normalized to {len(df)} rows "
+        f"({df['HOME_TEAM'].nunique()} unique home teams, "
+        f"{df['Date'].dt.year.nunique()} seasons)"
+    )
+    return df
 
 
 def compute_implied_probability(american_odds):
