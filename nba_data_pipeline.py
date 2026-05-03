@@ -98,21 +98,30 @@ def pull_game_logs(seasons):
     print("Pulling game logs...")
     all_games = []
 
+    # Pull regular season + playoffs separately and tag each row so
+    # downstream consumers can filter or weight playoff games (the most
+    # informative precedent for betting models).
+    season_types = ["Regular Season", "Playoffs"]
+
     for season in seasons:
         print(f"  Season: {season}")
-        try:
-            finder = leaguegamefinder.LeagueGameFinder(
-                season_nullable=season,
-                league_id_nullable="00",  # NBA
-                season_type_nullable="Regular Season",
-            )
-            games = finder.get_data_frames()[0]
-            games["SEASON"] = season
-            all_games.append(games)
-            time.sleep(SLEEP_BETWEEN_CALLS)
-        except Exception as e:
-            print(f"    Error pulling {season}: {e}")
-            time.sleep(2)
+        for season_type in season_types:
+            try:
+                finder = leaguegamefinder.LeagueGameFinder(
+                    season_nullable=season,
+                    league_id_nullable="00",  # NBA
+                    season_type_nullable=season_type,
+                )
+                games = finder.get_data_frames()[0]
+                if games.empty:
+                    continue
+                games["SEASON"] = season
+                games["SEASON_TYPE"] = season_type
+                all_games.append(games)
+                time.sleep(SLEEP_BETWEEN_CALLS)
+            except Exception as e:
+                print(f"    Error pulling {season} ({season_type}): {e}")
+                time.sleep(2)
 
     if not all_games:
         print("No game data pulled. Check your connection.")
