@@ -145,9 +145,12 @@ def add_schedule_context(df):
     df["REST_DAYS"] = (df["GAME_DATE"] - df["PREV_GAME_DATE"]).dt.days
     df["BACK_TO_BACK"] = (df["REST_DAYS"] == 1).astype(int)
 
-    # Rolling form: win percentage over last 10 games
+    # Rolling form: win percentage over last 10 games, isolated per season
+    # so end-of-season form does not bleed into the next season's opener
+    # (different roster, different team).
+    df = df.sort_values(["TEAM_ID", "SEASON", "GAME_DATE"]).reset_index(drop=True)
     df["ROLLING_WIN_PCT"] = (
-        df.groupby("TEAM_ID")["WIN"]
+        df.groupby(["TEAM_ID", "SEASON"])["WIN"]
         .transform(lambda x: x.rolling(10, min_periods=1).mean())
     )
 
