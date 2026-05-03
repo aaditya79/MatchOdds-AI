@@ -504,6 +504,7 @@ def run_agent(game_description, llm_call_fn, max_steps=12):
 def call_anthropic(messages):
     """Call Claude API."""
     import anthropic
+    from nba_cost_logger import log_anthropic_response
 
     client = anthropic.Anthropic()
 
@@ -522,12 +523,14 @@ def call_anthropic(messages):
         system=system_msg,
         messages=conv_messages,
     )
+    log_anthropic_response("nba_agent.py", response)
     return response.content[0].text
 
 
 def call_openai(messages):
     """Call OpenAI API."""
     from openai import OpenAI
+    from nba_cost_logger import log_openai_response
 
     client = OpenAI()
     response = client.chat.completions.create(
@@ -535,6 +538,7 @@ def call_openai(messages):
         messages=messages,
         max_tokens=4096,
     )
+    log_openai_response("nba_agent.py", response)
     return response.choices[0].message.content
 
 
