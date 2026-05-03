@@ -28,6 +28,10 @@ from datetime import datetime
 
 DATA_DIR = "data"
 
+# Maximum number of characters retained from a tool observation before truncation.
+# Override at runtime via the NBA_MAX_OBSERVATION_CHARS env var.
+MAX_TOOL_OBSERVATION_CHARS = int(os.environ.get("NBA_MAX_OBSERVATION_CHARS", "3000"))
+
 
 def tool_get_team_stats(team_abbr, season=None):
     """Get recent team stats and form."""
@@ -454,8 +458,8 @@ def run_agent(game_description, llm_call_fn, max_steps=12):
             observation = call_tool(tool_name, kwargs)
 
             # Truncate long observations
-            if len(observation) > 3000:
-                observation = observation[:3000] + "\n... (truncated)"
+            if len(observation) > MAX_TOOL_OBSERVATION_CHARS:
+                observation = observation[:MAX_TOOL_OBSERVATION_CHARS] + "\n... (truncated)"
 
             print(f"  OBSERVATION: {observation[:150]}...")
 

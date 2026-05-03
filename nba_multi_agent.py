@@ -39,6 +39,7 @@ from nba_agent import (
     tool_get_team_sentiment,
     parse_action,
     DATA_DIR,
+    MAX_TOOL_OBSERVATION_CHARS,
 )
 
 
@@ -196,8 +197,8 @@ def run_single_agent(agent_key, game_description, llm_call_fn, extra_context="",
             if tool_name in agent["tools"]:
                 print(f"  Step {step+1}: {tool_name}({kwargs})")
                 result = agent["tools"][tool_name](**kwargs)
-                if len(str(result)) > 3000:
-                    result = str(result)[:3000] + "\n... (truncated)"
+                if len(str(result)) > MAX_TOOL_OBSERVATION_CHARS:
+                    result = str(result)[:MAX_TOOL_OBSERVATION_CHARS] + "\n... (truncated)"
                 print(f"    -> {str(result)[:120]}...")
 
                 messages.append({"role": "assistant", "content": response_text})
