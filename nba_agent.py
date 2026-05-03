@@ -115,11 +115,22 @@ def merge_info_density(target, observation_tool, observation_text):
     return target
 
 
-def tool_get_team_stats(team_abbr, season=None):
-    """Get recent team stats and form."""
+def tool_get_team_stats(team_abbr, season=None, as_of_date=None):
+    """
+    Get recent team stats and form.
+
+    When as_of_date (YYYY-MM-DD string or pandas Timestamp) is provided, only
+    games strictly before that date are considered. Default None preserves the
+    Streamlit behaviour (no filtering).
+    """
     try:
         game_logs = pd.read_csv(f"{DATA_DIR}/game_logs.csv")
         game_logs["GAME_DATE"] = pd.to_datetime(game_logs["GAME_DATE"], errors="coerce")
+
+        if as_of_date is not None:
+            cutoff = pd.to_datetime(as_of_date, errors="coerce")
+            if pd.notna(cutoff):
+                game_logs = game_logs[game_logs["GAME_DATE"] < cutoff].copy()
 
         team_all = game_logs[game_logs["TEAM_ABBREVIATION"] == team_abbr].copy()
         if team_all.empty:
@@ -171,10 +182,32 @@ def tool_get_team_stats(team_abbr, season=None):
         return f"Error getting stats for {team_abbr}: {e}"
 
 
-def tool_get_head_to_head(team1_abbr, team2_abbr):
-    """Get head-to-head record between two teams."""
+def tool_get_head_to_head(team1_abbr, team2_abbr, as_of_date=None):
+    """
+    Get head-to-head record between two teams.
+
+    The H2H CSV is aggregated per season and has no per-game date column. When
+    as_of_date is provided, we conservatively drop seasons whose start year is
+    >= the as_of_date year so the agent never sees an aggregate that mixes in
+    games played after the prediction cutoff. Default None preserves the
+    Streamlit behaviour.
+    """
     try:
         h2h = pd.read_csv(f"{DATA_DIR}/head_to_head.csv")
+
+        if as_of_date is not None:
+            cutoff = pd.to_datetime(as_of_date, errors="coerce")
+            if pd.notna(cutoff):
+                # SEASON column is e.g. "2023-24"; the leading 4 digits are the
+                # start year. Keep only seasons that started strictly before
+                # the as_of_date's year. This is conservative — it also drops
+                # earlier-season games of the in-progress season — but avoids
+                # leaking any post-cutoff games via the aggregate row.
+                h2h = h2h[
+                    pd.to_numeric(h2h["SEASON"].astype(str).str[:4], errors="coerce")
+                    < cutoff.year
+                ].copy()
+
         matchup = h2h[
             (h2h["TEAM_ABBREVIATION"] == team1_abbr) &
             (h2h["OPPONENT_ABB"] == team2_abbr)
@@ -211,8 +244,21 @@ def tool_get_head_to_head(team1_abbr, team2_abbr):
         return f"Error getting H2H: {e}"
 
 
-def tool_get_injuries(team_name=None):
-    """Get current injury report. Optionally filter by team."""
+def tool_get_injuries(team_name=None, as_of_date=None):
+    """
+    Get current injury report. Optionally filter by team.
+
+    The injuries CSV is a live snapshot scraped today and carries no
+    historical date column. When as_of_date is provided we cannot reconstruct
+    that day's injury list, so we return a clear "no historical snapshot"
+    message instead of leaking today's injuries into a backtest.
+    """
+    if as_of_date is not None:
+        return (
+            f"No historical injury snapshot available for {as_of_date}. "
+            "The injuries CSV is a live scrape with no per-day history; "
+            "use stats / H2H / vector hits to reason about availability."
+        )
     try:
         injuries = pd.read_csv(f"{DATA_DIR}/injuries.csv")
         if injuries.empty:
@@ -243,10 +289,36 @@ def tool_get_injuries(team_name=None):
     except Exception as e:
         return f"Error getting injuries: {e}"
 
-def tool_get_team_sentiment(team_abbr):
-    """Get team-level media/news sentiment from aggregated news coverage."""
+def tool_get_team_sentiment(team_abbr, as_of_date=None):
+    """
+    Get team-level media/news sentiment from aggregated news coverage.
+
+    The aggregate sentiment CSV typically has no per-row date column. If a
+    SCRAPE_DATE / DATE column is present and as_of_date is supplied, we drop
+    rows scraped on or after that date. Otherwise as_of_date returns a
+    "no historical sentiment snapshot" message — better than silently leaking
+    today's sentiment into a past prediction.
+    """
     try:
         sentiment = pd.read_csv(f"{DATA_DIR}/team_sentiment.csv")
+
+        if as_of_date is not None:
+            cutoff = pd.to_datetime(as_of_date, errors="coerce")
+            date_col = next(
+                (c for c in ("SCRAPE_DATE", "DATE", "GAME_DATE") if c in sentiment.columns),
+                None,
+            )
+            if pd.isna(cutoff):
+                pass
+            elif date_col is None:
+                return (
+                    f"No historical sentiment snapshot available for {as_of_date}. "
+                    "The team_sentiment CSV has no date column."
+                )
+            else:
+                sentiment = sentiment[
+                    pd.to_datetime(sentiment[date_col], errors="coerce") < cutoff
+                ].copy()
 
         team_row = sentiment[sentiment["TEAM"] == team_abbr]
 
@@ -270,8 +342,21 @@ def tool_get_team_sentiment(team_abbr):
     except Exception as e:
         return f"Error getting sentiment for {team_abbr}: {e}"
 
-def tool_get_odds(home_team=None, away_team=None):
-    """Get current betting odds for upcoming games."""
+def tool_get_odds(home_team=None, away_team=None, as_of_date=None):
+    """
+    Get current betting odds for upcoming games.
+
+    The odds_live CSV is a snapshot of upcoming-game odds; it cannot represent
+    historical lines. When as_of_date is provided we return a clear message
+    so the agent knows to skip market-derived reasoning during backtests
+    (the backtest script matches the historical line separately).
+    """
+    if as_of_date is not None:
+        return (
+            f"No live odds snapshot available for {as_of_date}. "
+            "Live odds reflect upcoming games only; historical lines are "
+            "matched separately by the backtest harness."
+        )
     try:
         odds = pd.read_csv(f"{DATA_DIR}/odds_live.csv")
         if odds.empty:
@@ -323,8 +408,14 @@ def tool_get_odds(home_team=None, away_team=None):
         return f"Error getting odds: {e}"
 
 
-def tool_search_similar_games(query_text, team=None, n_results=5):
-    """Search the vector store for historically similar games."""
+def tool_search_similar_games(query_text, team=None, n_results=5, as_of_date=None):
+    """
+    Search the vector store for historically similar games.
+
+    When as_of_date is provided, results whose metadata.game_date is on or
+    after the cutoff are dropped post-retrieval. We over-fetch (3x) so we
+    still return up to n_results valid hits in most cases.
+    """
     try:
         from nba_vector_store import query_similar_games
 
@@ -332,14 +423,26 @@ def tool_search_similar_games(query_text, team=None, n_results=5):
         if team:
             where_filter = {"team": team}
 
-        results = query_similar_games(query_text, n_results=n_results, where_filter=where_filter)
+        # Over-fetch when filtering so we can drop leaked rows and still
+        # return n_results historically-valid hits.
+        fetch_count = n_results * 3 if as_of_date is not None else n_results
+        results = query_similar_games(query_text, n_results=fetch_count, where_filter=where_filter)
 
         output = []
+        cutoff = pd.to_datetime(as_of_date, errors="coerce") if as_of_date is not None else None
+
         for i in range(len(results["documents"][0])):
+            meta = results["metadatas"][0][i]
+            if cutoff is not None and pd.notna(cutoff):
+                game_date = pd.to_datetime(meta.get("game_date"), errors="coerce")
+                if pd.notna(game_date) and game_date >= cutoff:
+                    continue
             output.append({
                 "game_description": results["documents"][0][i],
-                "metadata": results["metadatas"][0][i],
+                "metadata": meta,
             })
+            if len(output) >= n_results:
+                break
         return json.dumps(output, indent=2)
     except Exception as e:
         return f"Error searching similar games: {e}"
