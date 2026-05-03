@@ -23,8 +23,17 @@ import math
 import time
 import random
 import argparse
+import functools
 import pandas as pd
 import numpy as np
+
+# Real reasoning entry points. The previous version of this file used local
+# static-prompt helpers and never invoked the live agent / tool stack — it was
+# essentially a different model from what Streamlit shipped. Wave 2 wires the
+# backtest into the same code path as the production app.
+from nba_agent import run_agent
+from nba_cot_baseline import run_cot_analysis
+from nba_multi_agent import run_full_debate
 
 DATA_DIR = "data"
 PREDICTIONS_OUT = f"{DATA_DIR}/backtest_predictions.csv"
@@ -114,6 +123,112 @@ def ablate_source(source_name):
                 fn_attr = "tool_" + short_name
                 if fn_attr in originals:
                     info["function"] = originals[fn_attr]
+
+
+# ============================================================
+# AS_OF_DATE TOOL FREEZE
+# ============================================================
+# The data tools in nba_agent take an optional as_of_date kwarg (added in
+# Wave 2). This context manager wraps every tool function so that during a
+# backtest run, every call automatically receives as_of_date=<game date> —
+# the agent never even sees the parameter. This is the leakage fix: without
+# it, an agent backtesting a 2024-12-25 game would happily read 2025 stats.
+
+# Tool functions (module-level) we transparently wrap.
+_FREEZABLE_TOOL_ATTRS = (
+    "tool_get_team_stats",
+    "tool_get_head_to_head",
+    "tool_get_injuries",
+    "tool_get_odds",
+    "tool_get_team_sentiment",
+    "tool_search_similar_games",
+)
+
+
+def _make_as_of_date_wrapper(original_fn, as_of_date):
+    @functools.wraps(original_fn)
+    def wrapped(*args, **kwargs):
+        kwargs.setdefault("as_of_date", as_of_date)
+        return original_fn(*args, **kwargs)
+    return wrapped
+
+
+@contextlib.contextmanager
+def freeze_tool_as_of_date(as_of_date):
+    """
+    Force every nba_agent data tool to receive as_of_date=<as_of_date>.
+
+    Patches three locations because the dependent modules captured tool
+    references at import time:
+      * nba_agent module attrs (used by run_agent + nba_agent.TOOLS)
+      * nba_agent.TOOLS registry entries
+      * nba_multi_agent.AGENTS[*]["tools"] dicts (frozen at import)
+      * nba_cot_baseline module-level imports (looked up at call time)
+
+    Originals are always restored, even if the body raises. as_of_date=None
+    is a no-op so the Streamlit code path is untouched.
+    """
+    if as_of_date is None:
+        yield
+        return
+
+    import nba_agent
+    import nba_multi_agent
+    import nba_cot_baseline
+
+    originals = {}
+
+    try:
+        # Patch nba_agent module-level functions.
+        for attr in _FREEZABLE_TOOL_ATTRS:
+            if not hasattr(nba_agent, attr):
+                continue
+            orig = getattr(nba_agent, attr)
+            originals[attr] = orig
+            setattr(nba_agent, attr, _make_as_of_date_wrapper(orig, as_of_date))
+
+        # Refresh nba_agent.TOOLS registry to point at the wrappers.
+        if hasattr(nba_agent, "TOOLS"):
+            for short_name, info in nba_agent.TOOLS.items():
+                fn_attr = "tool_" + short_name
+                if fn_attr in originals:
+                    info["function"] = getattr(nba_agent, fn_attr)
+
+        # Refresh nba_multi_agent.AGENTS tool dicts (captured at import time).
+        for agent_def in nba_multi_agent.AGENTS.values():
+            for short_name in list(agent_def["tools"]):
+                fn_attr = "tool_" + short_name
+                if fn_attr in originals:
+                    agent_def["tools"][short_name] = getattr(nba_agent, fn_attr)
+
+        # Refresh nba_cot_baseline's module-bound names. cot's gather function
+        # rebuilds its tool dict on every call by looking these up.
+        for attr in _FREEZABLE_TOOL_ATTRS:
+            if attr in originals and hasattr(nba_cot_baseline, attr):
+                setattr(nba_cot_baseline, attr, getattr(nba_agent, attr))
+
+        yield
+
+    finally:
+        # Restore everything in reverse order.
+        for attr in _FREEZABLE_TOOL_ATTRS:
+            if attr in originals and hasattr(nba_cot_baseline, attr):
+                setattr(nba_cot_baseline, attr, originals[attr])
+
+        for agent_def in nba_multi_agent.AGENTS.values():
+            for short_name in list(agent_def["tools"]):
+                fn_attr = "tool_" + short_name
+                if fn_attr in originals:
+                    agent_def["tools"][short_name] = originals[fn_attr]
+
+        if hasattr(nba_agent, "TOOLS"):
+            for short_name, info in nba_agent.TOOLS.items():
+                fn_attr = "tool_" + short_name
+                if fn_attr in originals:
+                    info["function"] = originals[fn_attr]
+
+        for attr, orig in originals.items():
+            setattr(nba_agent, attr, orig)
 
 
 def scrub_snapshot_for_ablation(snapshot, source_name):
@@ -350,95 +465,101 @@ def build_historical_snapshot(game_logs, game_row, min_games_history):
 
 
 # ============================================================
-# PROMPTS
+# AGENT REPORT PARSING + TEAM NAME LOOKUP
 # ============================================================
 
-def single_agent_prompt(snapshot):
-    return f"""
-You are an NBA analyst making a pregame prediction using only the historical information below.
-
-IMPORTANT:
-- Use only the provided data
-- Do not invent injuries, odds, or sentiment
-- Output valid JSON only
-
-SNAPSHOT:
-{json.dumps(snapshot, indent=2)}
-
-Return JSON in exactly this shape:
-{{
-  "method": "single_agent",
-  "home_win_prob": 0.XX,
-  "away_win_prob": 0.XX,
-  "confidence": "high/medium/low",
-  "key_factors": ["...", "...", "..."],
-  "reasoning": "..."
-}}
-""".strip()
+@functools.lru_cache(maxsize=1)
+def _team_name_lookup():
+    """abbreviation -> full team name (e.g. 'LAL' -> 'Los Angeles Lakers')."""
+    path = f"{DATA_DIR}/teams.csv"
+    if not os.path.exists(path):
+        return {}
+    df = pd.read_csv(path)
+    if "abbreviation" not in df.columns or "full_name" not in df.columns:
+        return {}
+    return {str(r["abbreviation"]): str(r["full_name"]) for _, r in df.iterrows()}
 
 
-def cot_prompt(snapshot):
-    return f"""
-You are an NBA analyst doing a careful chain-of-thought style evaluation using only the historical information below.
-
-IMPORTANT:
-- Use only the provided data
-- Do not invent injuries, odds, or sentiment
-- Output valid JSON only
-
-SNAPSHOT:
-{json.dumps(snapshot, indent=2)}
-
-Return JSON in exactly this shape:
-{{
-  "method": "chain_of_thought",
-  "home_win_prob": 0.XX,
-  "away_win_prob": 0.XX,
-  "confidence": "high/medium/low",
-  "key_factors": ["...", "...", "..."],
-  "reasoning": "..."
-}}
-""".strip()
+def abbr_to_full_name(abbr):
+    """Look up a full team name from abbreviation, with safe fallback."""
+    return _team_name_lookup().get(str(abbr), str(abbr))
 
 
-def debate_prompt(snapshot):
-    return f"""
-You are simulating a compact multi-agent debate for an NBA game using only the historical information below.
-
-Agents:
-1. Stats Agent: focuses on record, last-10 form, efficiency, plus/minus
-2. Context Agent: focuses on home court, recent momentum, head-to-head
-3. Moderator: synthesizes both views
-
-IMPORTANT:
-- Use only the provided data
-- Do not invent injuries, odds, or sentiment
-- Output valid JSON only
-
-SNAPSHOT:
-{json.dumps(snapshot, indent=2)}
-
-Return JSON in exactly this shape:
-{{
-  "method": "multi_agent_debate",
-  "stats_agent_home_prob": 0.XX,
-  "context_agent_home_prob": 0.XX,
-  "home_win_prob": 0.XX,
-  "away_win_prob": 0.XX,
-  "confidence": "high/medium/low",
-  "key_factors": ["...", "...", "..."],
-  "reasoning": "..."
-}}
-""".strip()
-
-
-def parse_json_response(text):
+def _extract_report_json(report_text):
+    """
+    Extract the JSON block from a free-form LLM response. Handles both
+    'FINAL REPORT: { ... }' and bare '{ ... }' shapes.
+    """
+    if report_text is None:
+        return None
+    text = str(report_text)
+    if "FINAL REPORT:" in text:
+        text = text.split("FINAL REPORT:")[-1]
     text = text.strip()
     start = text.find("{")
     end = text.rfind("}") + 1
-    if start >= 0 and end > start:
-        text = text[start:end]
-    return json.loads(text)
+    if start < 0 or end <= start:
+        return None
+    candidate = text[start:end]
+    try:
+        return json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _normalize_agent_report(report_json, method_name):
+    """
+    Normalize the various agent report shapes into the canonical fields the
+    backtest writes to CSV: home_win_prob, away_win_prob, confidence,
+    key_factors, reasoning.
+
+    Shapes we accept:
+      * single agent (nba_agent.run_agent):
+          {"agent_prediction": {"home_win_prob","away_win_prob","confidence"},
+           "key_factors": [...], "reasoning": "..."}
+      * CoT (nba_cot_baseline.run_cot_analysis):
+          {"prediction": {"home_win_prob","away_win_prob","confidence"},
+           "key_factors": [...], "reasoning": "..."}
+      * multi-agent debate (nba_multi_agent.run_full_debate, moderator):
+          {"synthesized_prediction": {"home_win_prob","away_win_prob",
+           "confidence"}, "key_factors": [...], "reasoning": "..."}
+      * defensively: top-level home_win_prob/away_win_prob.
+
+    Raises ValueError if no probability pair can be recovered.
+    """
+    if not isinstance(report_json, dict):
+        raise ValueError(f"{method_name}: report is not a JSON object")
+
+    pred = (
+        report_json.get("synthesized_prediction")
+        or report_json.get("agent_prediction")
+        or report_json.get("prediction")
+        or {}
+    )
+
+    home = pred.get("home_win_prob") if isinstance(pred, dict) else None
+    away = pred.get("away_win_prob") if isinstance(pred, dict) else None
+    if home is None:
+        home = report_json.get("home_win_prob")
+    if away is None:
+        away = report_json.get("away_win_prob")
+    if home is None or away is None:
+        raise ValueError(f"{method_name}: could not find home/away win probabilities")
+
+    confidence = ""
+    if isinstance(pred, dict):
+        confidence = pred.get("confidence", "") or ""
+    if not confidence:
+        confidence = report_json.get("confidence", "") or ""
+
+    return {
+        "method": method_name,
+        "home_win_prob": float(home),
+        "away_win_prob": float(away),
+        "confidence": confidence,
+        "key_factors": report_json.get("key_factors", []),
+        "reasoning": report_json.get("reasoning", ""),
+    }
 
 
 # ============================================================
@@ -504,13 +625,9 @@ def run_with_retry(fn, max_retries=4, base_sleep=2.0):
 
 def _empty_backtest_info_density():
     """
-    Info-density counters for one backtest game.
-
-    The current backtest calls the LLM with a pre-built snapshot string and
-    does NOT invoke the live tool layer (youtube, news, vector store), so the
-    source-count fields stay at 0 here. context_tokens is captured per call
-    via nba_cost_logger.tally_calls(). Wave 2 agent runners can populate the
-    rest by threading info_density through the same shape.
+    Info-density counters for one backtest game. Real values come back from
+    the agent runners (each populates an info_density dict with
+    youtube_comments / news_articles / vector_hits / context_tokens).
     """
     return {
         "youtube_comments": 0,
@@ -520,46 +637,77 @@ def _empty_backtest_info_density():
     }
 
 
-def _run_with_token_capture(llm_fn, messages):
+def _build_game_description(snapshot):
     """
-    Call the LLM and return (response_text, input_tokens). Falls back to 0
-    tokens if the cost logger does not see a usage record (e.g. cached path).
+    Build the human-readable game string the live agents expect, matching
+    the format Streamlit uses: '<away full name> vs <home full name>, <Mon DD, YYYY>'.
     """
-    from nba_cost_logger import tally_calls
-    with tally_calls() as call_records:
-        response = llm_fn(messages)
-    input_tokens = sum(int(r.get("input_tokens", 0) or 0) for r in call_records)
-    return response, input_tokens
+    game = snapshot["game"]
+    home_name = abbr_to_full_name(game["home_team"])
+    away_name = abbr_to_full_name(game["away_team"])
+    game_date = pd.to_datetime(game["date"], errors="coerce")
+    if pd.notna(game_date):
+        date_str = game_date.strftime("%B %d, %Y")
+    else:
+        date_str = str(game["date"])
+    return f"{away_name} vs {home_name}, {date_str}", home_name, away_name
 
 
 def run_single_agent_backtest(snapshot, llm_fn):
-    info_density = _empty_backtest_info_density()
-    response, input_tokens = _run_with_token_capture(
-        llm_fn, [{"role": "user", "content": single_agent_prompt(snapshot)}]
-    )
-    info_density["context_tokens"] = input_tokens
-    parsed = parse_json_response(response)
-    return parsed, response, info_density
+    """Invoke nba_agent.run_agent under an as_of_date freeze."""
+    game_description, _home_name, _away_name = _build_game_description(snapshot)
+    as_of_date = snapshot["game"]["date"]
+
+    with freeze_tool_as_of_date(as_of_date):
+        result = run_agent(game_description, llm_fn)
+
+    raw = result.get("final_response", "")
+    info_density = result.get("info_density") or _empty_backtest_info_density()
+
+    report_json = _extract_report_json(raw)
+    parsed = _normalize_agent_report(report_json, method_name="single_agent")
+    return parsed, raw, info_density
 
 
 def run_cot_backtest(snapshot, llm_fn):
-    info_density = _empty_backtest_info_density()
-    response, input_tokens = _run_with_token_capture(
-        llm_fn, [{"role": "user", "content": cot_prompt(snapshot)}]
-    )
-    info_density["context_tokens"] = input_tokens
-    parsed = parse_json_response(response)
-    return parsed, response, info_density
+    """Invoke nba_cot_baseline.run_cot_analysis under an as_of_date freeze."""
+    game_description, home_name, away_name = _build_game_description(snapshot)
+    as_of_date = snapshot["game"]["date"]
+    home_abbr = snapshot["game"]["home_team"]
+    away_abbr = snapshot["game"]["away_team"]
+
+    with freeze_tool_as_of_date(as_of_date):
+        result = run_cot_analysis(
+            home_abbr=home_abbr,
+            away_abbr=away_abbr,
+            home_name=home_name,
+            away_name=away_name,
+            game_description=game_description,
+            llm_call_fn=llm_fn,
+        )
+
+    raw = result.get("response", "")
+    info_density = result.get("info_density") or _empty_backtest_info_density()
+
+    report_json = _extract_report_json(raw)
+    parsed = _normalize_agent_report(report_json, method_name="chain_of_thought")
+    return parsed, raw, info_density
 
 
 def run_multi_agent_backtest(snapshot, llm_fn):
-    info_density = _empty_backtest_info_density()
-    response, input_tokens = _run_with_token_capture(
-        llm_fn, [{"role": "user", "content": debate_prompt(snapshot)}]
-    )
-    info_density["context_tokens"] = input_tokens
-    parsed = parse_json_response(response)
-    return parsed, response, info_density
+    """Invoke nba_multi_agent.run_full_debate under an as_of_date freeze."""
+    game_description, _home_name, _away_name = _build_game_description(snapshot)
+    as_of_date = snapshot["game"]["date"]
+
+    with freeze_tool_as_of_date(as_of_date):
+        result = run_full_debate(game_description, llm_fn)
+
+    raw = result.get("final_report", "")
+    info_density = result.get("info_density") or _empty_backtest_info_density()
+
+    report_json = _extract_report_json(raw)
+    parsed = _normalize_agent_report(report_json, method_name="multi_agent_debate")
+    return parsed, raw, info_density
 
 
 # ============================================================
