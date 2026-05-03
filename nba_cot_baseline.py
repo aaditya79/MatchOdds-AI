@@ -26,6 +26,8 @@ from nba_agent import (
     tool_search_similar_games,
     tool_get_team_sentiment,
     DATA_DIR,
+    empty_info_density,
+    merge_info_density,
 )
 
 
@@ -37,61 +39,74 @@ def gather_all_evidence(home_team_abbr, away_team_abbr, home_team_name, away_tea
     """
     Gather all available data upfront. No agent decision-making here.
     Just pull everything and hand it to the LLM in one shot.
+
+    Populates `_info_density` with real per-source counters
+    (youtube_comments, news_articles, vector_hits) plus the legacy
+    aggregate fields kept for backward compatibility.
     """
     print("Gathering all evidence upfront...")
     evidence = {}
+    info_density = empty_info_density()
 
-    print(f"  Getting {home_team_abbr} stats...")
-    evidence["home_team_stats"] = tool_get_team_stats(home_team_abbr)
+    # (tool_name, args_dict, evidence_key) — declared up front so each call
+    # uses the same path for fetching, info-density updates, and storage.
+    queries = [
+        ("get_team_stats", {"team_abbr": home_team_abbr}, "home_team_stats"),
+        ("get_team_stats", {"team_abbr": away_team_abbr}, "away_team_stats"),
+        ("get_head_to_head",
+         {"team1_abbr": home_team_abbr, "team2_abbr": away_team_abbr},
+         "head_to_head"),
+        ("get_injuries", {"team_name": home_team_name}, "home_injuries"),
+        ("get_injuries", {"team_name": away_team_name}, "away_injuries"),
+        ("get_team_sentiment", {"team_abbr": home_team_abbr}, "home_team_sentiment"),
+        ("get_team_sentiment", {"team_abbr": away_team_abbr}, "away_team_sentiment"),
+        ("get_odds", {"home_team": home_team_name, "away_team": away_team_name}, "odds"),
+        ("search_similar_games",
+         {"query_text": f"{home_team_abbr} home game recent form",
+          "team": home_team_abbr, "n_results": 3},
+         "similar_home"),
+        ("search_similar_games",
+         {"query_text": f"{away_team_abbr} away game recent form",
+          "team": away_team_abbr, "n_results": 3},
+         "similar_away"),
+    ]
 
-    print(f"  Getting {away_team_abbr} stats...")
-    evidence["away_team_stats"] = tool_get_team_stats(away_team_abbr)
+    tool_funcs = {
+        "get_team_stats": tool_get_team_stats,
+        "get_head_to_head": tool_get_head_to_head,
+        "get_injuries": tool_get_injuries,
+        "get_team_sentiment": tool_get_team_sentiment,
+        "get_odds": tool_get_odds,
+        "search_similar_games": tool_search_similar_games,
+    }
 
-    print(f"  Getting H2H record...")
-    evidence["head_to_head"] = tool_get_head_to_head(home_team_abbr, away_team_abbr)
-
-    print(f"  Getting {home_team_name} injuries...")
-    evidence["home_injuries"] = tool_get_injuries(home_team_name)
-
-    print(f"  Getting {away_team_name} injuries...")
-    evidence["away_injuries"] = tool_get_injuries(away_team_name)
-
-    print(f"  Getting {home_team_abbr} sentiment...")
-    evidence["home_team_sentiment"] = tool_get_team_sentiment(home_team_abbr)
-
-    print(f"  Getting {away_team_abbr} sentiment...")
-    evidence["away_team_sentiment"] = tool_get_team_sentiment(away_team_abbr)
-
-    print(f"  Getting odds...")
-    evidence["odds"] = tool_get_odds(home_team_name, away_team_name)
-
-    print(f"  Searching similar games for {home_team_abbr}...")
-    evidence["similar_home"] = tool_search_similar_games(
-        f"{home_team_abbr} home game recent form",
-        team=home_team_abbr,
-        n_results=3
-    )
-
-    print(f"  Searching similar games for {away_team_abbr}...")
-    evidence["similar_away"] = tool_search_similar_games(
-        f"{away_team_abbr} away game recent form",
-        team=away_team_abbr,
-        n_results=3
-    )
+    for tool_name, args, key in queries:
+        print(f"  Fetching {key} via {tool_name}...")
+        result = tool_funcs[tool_name](**args)
+        evidence[key] = result
+        merge_info_density(info_density, tool_name, result)
 
     total_chars = sum(len(str(v)) for v in evidence.values())
+
+    # Real per-source counters replace the previous char-count proxy. The
+    # legacy aggregate fields (total_characters, sources_with_data,
+    # total_sources_queried) are preserved so the existing CoT prompt and
+    # any downstream consumers still see the same shape.
     evidence["_info_density"] = {
+        **info_density,
         "total_characters": total_chars,
         "sources_with_data": sum(
             1 for v in evidence.values()
             if v and str(v) != "[]" and "No " not in str(v)[:20]
         ),
-        "total_sources_queried": len(evidence),
+        "total_sources_queried": len(queries),
     }
 
     print(
-        f"  Total evidence: {total_chars} characters from "
-        f"{evidence['_info_density']['sources_with_data']} sources"
+        f"  Total evidence: {total_chars} characters | "
+        f"news_articles={info_density['news_articles']} "
+        f"youtube_comments={info_density['youtube_comments']} "
+        f"vector_hits={info_density['vector_hits']}"
     )
     return evidence
 
@@ -223,6 +238,8 @@ def run_cot_analysis(home_abbr, away_abbr, home_name, away_name, game_descriptio
     2. Send everything to the LLM in one prompt
     3. Get back a single-pass analysis
     """
+    from nba_cost_logger import tally_calls
+
     evidence = gather_all_evidence(home_abbr, away_abbr, home_name, away_name)
     prompt = build_cot_prompt(game_description, evidence)
 
@@ -231,7 +248,15 @@ def run_cot_analysis(home_abbr, away_abbr, home_name, away_name, game_descriptio
         {"role": "user", "content": prompt},
     ]
 
-    response = llm_call_fn(messages)
+    with tally_calls() as call_records:
+        response = llm_call_fn(messages)
+
+    context_tokens = sum(int(r.get("input_tokens", 0) or 0) for r in call_records)
+    info_density = dict(evidence["_info_density"])
+    info_density["context_tokens"] = context_tokens
+    # Keep evidence['_info_density'] in sync so downstream consumers see one
+    # canonical view.
+    evidence["_info_density"] = info_density
 
     return {
         "game": game_description,
@@ -239,7 +264,7 @@ def run_cot_analysis(home_abbr, away_abbr, home_name, away_name, game_descriptio
         "evidence": evidence,
         "response": response,
         "llm_calls": 1,
-        "info_density": evidence["_info_density"],
+        "info_density": info_density,
     }
 
 

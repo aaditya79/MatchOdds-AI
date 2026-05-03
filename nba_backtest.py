@@ -359,12 +359,14 @@ def load_cached_result(snapshot, method_name):
     return None
 
 
-def save_cached_result(snapshot, method_name, parsed, raw):
+def save_cached_result(snapshot, method_name, parsed, raw, info_density=None):
     path = get_cache_path(snapshot, method_name)
     payload = {
         "parsed": parsed,
         "raw": raw,
     }
+    if info_density is not None:
+        payload["info_density"] = info_density
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
 
@@ -396,19 +398,64 @@ def run_with_retry(fn, max_retries=4, base_sleep=2.0):
 # RUNNERS
 # ============================================================
 
+def _empty_backtest_info_density():
+    """
+    Info-density counters for one backtest game.
+
+    The current backtest calls the LLM with a pre-built snapshot string and
+    does NOT invoke the live tool layer (youtube, news, vector store), so the
+    source-count fields stay at 0 here. context_tokens is captured per call
+    via nba_cost_logger.tally_calls(). Wave 2 agent runners can populate the
+    rest by threading info_density through the same shape.
+    """
+    return {
+        "youtube_comments": 0,
+        "news_articles": 0,
+        "vector_hits": 0,
+        "context_tokens": 0,
+    }
+
+
+def _run_with_token_capture(llm_fn, messages):
+    """
+    Call the LLM and return (response_text, input_tokens). Falls back to 0
+    tokens if the cost logger does not see a usage record (e.g. cached path).
+    """
+    from nba_cost_logger import tally_calls
+    with tally_calls() as call_records:
+        response = llm_fn(messages)
+    input_tokens = sum(int(r.get("input_tokens", 0) or 0) for r in call_records)
+    return response, input_tokens
+
+
 def run_single_agent_backtest(snapshot, llm_fn):
-    response = llm_fn([{"role": "user", "content": single_agent_prompt(snapshot)}])
-    return parse_json_response(response), response
+    info_density = _empty_backtest_info_density()
+    response, input_tokens = _run_with_token_capture(
+        llm_fn, [{"role": "user", "content": single_agent_prompt(snapshot)}]
+    )
+    info_density["context_tokens"] = input_tokens
+    parsed = parse_json_response(response)
+    return parsed, response, info_density
 
 
 def run_cot_backtest(snapshot, llm_fn):
-    response = llm_fn([{"role": "user", "content": cot_prompt(snapshot)}])
-    return parse_json_response(response), response
+    info_density = _empty_backtest_info_density()
+    response, input_tokens = _run_with_token_capture(
+        llm_fn, [{"role": "user", "content": cot_prompt(snapshot)}]
+    )
+    info_density["context_tokens"] = input_tokens
+    parsed = parse_json_response(response)
+    return parsed, response, info_density
 
 
 def run_multi_agent_backtest(snapshot, llm_fn):
-    response = llm_fn([{"role": "user", "content": debate_prompt(snapshot)}])
-    return parse_json_response(response), response
+    info_density = _empty_backtest_info_density()
+    response, input_tokens = _run_with_token_capture(
+        llm_fn, [{"role": "user", "content": debate_prompt(snapshot)}]
+    )
+    info_density["context_tokens"] = input_tokens
+    parsed = parse_json_response(response)
+    return parsed, response, info_density
 
 
 # ============================================================
@@ -697,10 +744,11 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
                 if cached is not None:
                     parsed = cached["parsed"]
                     raw = cached["raw"]
+                    info_density = cached.get("info_density") or _empty_backtest_info_density()
                     print(f"  {method_name}: loaded from cache")
                 else:
-                    parsed, raw = run_with_retry(lambda: runner(snapshot, llm_fn))
-                    save_cached_result(snapshot, method_name, parsed, raw)
+                    parsed, raw, info_density = run_with_retry(lambda: runner(snapshot, llm_fn))
+                    save_cached_result(snapshot, method_name, parsed, raw, info_density=info_density)
 
                 home_prob = safe_clip_prob(parsed["home_win_prob"])
                 away_prob = safe_clip_prob(parsed["away_win_prob"])
@@ -731,6 +779,10 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER, m
                     "reasoning": parsed.get("reasoning", ""),
                     "market_home_implied_prob": market_home_implied_prob,
                     "market_away_implied_prob": market_away_implied_prob,
+                    "info_density_youtube_comments": int(info_density.get("youtube_comments", 0) or 0),
+                    "info_density_news_articles": int(info_density.get("news_articles", 0) or 0),
+                    "info_density_vector_hits": int(info_density.get("vector_hits", 0) or 0),
+                    "info_density_context_tokens": int(info_density.get("context_tokens", 0) or 0),
                     "raw_response": raw,
                 })
 

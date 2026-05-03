@@ -17,6 +17,7 @@ result is still returned to the caller and a warning is printed. We never let
 logging break the pipeline.
 """
 
+import contextlib
 import json
 import os
 import threading
@@ -39,6 +40,38 @@ MODEL_PRICING = {
 DEFAULT_PRICING = {"input": 3.00, "output": 15.00}
 
 _log_lock = threading.Lock()
+
+# Thread-local stack of active "subscribers" — lists that record_llm_call appends
+# to as well as writing to disk. Used by the `tally_calls` context manager so
+# callers can capture token counts for one logical task (e.g. one game).
+_subscribers_local = threading.local()
+
+
+def _get_subscriber_stack():
+    if not hasattr(_subscribers_local, "stack"):
+        _subscribers_local.stack = []
+    return _subscribers_local.stack
+
+
+@contextlib.contextmanager
+def tally_calls():
+    """
+    Context manager that captures every record_llm_call made on this thread
+    inside the `with` block. Yields a list to which call records are appended.
+
+    Example:
+        with tally_calls() as records:
+            llm_fn(messages)
+            llm_fn(messages)
+        total_input = sum(r["input_tokens"] for r in records)
+    """
+    bucket = []
+    stack = _get_subscriber_stack()
+    stack.append(bucket)
+    try:
+        yield bucket
+    finally:
+        stack.pop()
 
 
 def _resolve_pricing(model):
@@ -93,6 +126,10 @@ def record_llm_call(file, model, input_tokens, output_tokens, extra=None):
     except Exception as e:
         # Logging must never break the call path.
         print(f"[cost_logger] WARNING: failed to write llm call record: {e}")
+
+    # Push to any active tally_calls() subscribers on this thread.
+    for sub in _get_subscriber_stack():
+        sub.append(record)
 
     return record
 

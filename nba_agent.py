@@ -33,6 +33,88 @@ DATA_DIR = "data"
 MAX_TOOL_OBSERVATION_CHARS = int(os.environ.get("NBA_MAX_OBSERVATION_CHARS", "3000"))
 
 
+# ============================================================
+# INFO DENSITY HELPERS
+# ============================================================
+# Per-game counters that quantify how much real information an LLM saw before
+# committing to a prediction. We thread these through every reasoning system
+# (single agent, multi-agent debate, CoT baseline) so the backtest can compare
+# accuracy vs information intake.
+
+def empty_info_density():
+    """Initial info-density counters for one game."""
+    return {
+        "youtube_comments": 0,
+        "news_articles": 0,
+        "vector_hits": 0,
+        "context_tokens": 0,
+    }
+
+
+def count_tool_result_items(tool_name, result_str):
+    """
+    Map a tool result string back to (youtube_comments, news_articles, vector_hits)
+    deltas. Returns a dict with the three count keys; missing keys default to 0.
+
+    The function is best-effort: tool results are JSON in the happy path but
+    can be plain error strings, so we never raise.
+    """
+    delta = {"youtube_comments": 0, "news_articles": 0, "vector_hits": 0}
+    if not result_str:
+        return delta
+
+    text = str(result_str)
+    # Skip error / empty payloads.
+    if text.startswith("Error") or text.startswith("No "):
+        return delta
+
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return delta
+
+    if tool_name == "search_similar_games":
+        # Tool returns a JSON list of {game_description, metadata}.
+        if isinstance(parsed, list):
+            delta["vector_hits"] = len(parsed)
+        return delta
+
+    if tool_name == "get_team_sentiment":
+        # Tool returns a single dict per team. Extract whichever count keys
+        # the underlying CSV exposes. Today that's article_count (news);
+        # once YouTube is wired in, COMMENT_COUNT will populate alongside.
+        if isinstance(parsed, dict):
+            news = parsed.get("article_count") or parsed.get("ARTICLE_COUNT") or 0
+            yt = (
+                parsed.get("comment_count")
+                or parsed.get("COMMENT_COUNT")
+                or parsed.get("youtube_comment_count")
+                or 0
+            )
+            try:
+                delta["news_articles"] = int(news)
+            except (TypeError, ValueError):
+                pass
+            try:
+                delta["youtube_comments"] = int(yt)
+            except (TypeError, ValueError):
+                pass
+        return delta
+
+    return delta
+
+
+def merge_info_density(target, observation_tool, observation_text):
+    """
+    Update an info_density dict in place using one tool observation. Returns
+    the updated dict for chaining.
+    """
+    deltas = count_tool_result_items(observation_tool, observation_text)
+    for k, v in deltas.items():
+        target[k] = target.get(k, 0) + int(v)
+    return target
+
+
 def tool_get_team_stats(team_abbr, season=None):
     """Get recent team stats and form."""
     try:
@@ -413,8 +495,11 @@ def run_agent(game_description, llm_call_fn, max_steps=12):
         max_steps: maximum number of tool calls before forcing final report
 
     Returns:
-        dict with the conversation history and final report
+        dict with the conversation history, final report, and info_density
+        counters (youtube_comments, news_articles, vector_hits, context_tokens).
     """
+    from nba_cost_logger import tally_calls
+
     system_prompt = build_system_prompt()
 
     messages = [
@@ -423,77 +508,92 @@ def run_agent(game_description, llm_call_fn, max_steps=12):
     ]
 
     conversation_log = []
+    info_density = empty_info_density()
     step = 0
 
     print(f"\nAnalyzing: {game_description}")
     print("=" * 60)
 
-    while step < max_steps:
-        # Call the LLM
-        response_text = llm_call_fn(messages)
+    with tally_calls() as call_records:
+        while step < max_steps:
+            # Call the LLM
+            response_text = llm_call_fn(messages)
 
-        # Log it
+            # Log it
+            conversation_log.append({
+                "step": step + 1,
+                "role": "assistant",
+                "content": response_text,
+            })
+
+            # Check if we have a final report
+            if "FINAL REPORT:" in response_text:
+                print(f"\nStep {step + 1}: FINAL REPORT generated")
+                info_density["context_tokens"] = sum(
+                    int(r.get("input_tokens", 0) or 0) for r in call_records
+                )
+                return {
+                    "conversation": conversation_log,
+                    "final_response": response_text,
+                    "steps": step + 1,
+                    "info_density": info_density,
+                }
+
+            # Parse and execute action
+            tool_name, kwargs, action_line = parse_action(response_text)
+
+            if tool_name:
+                print(f"Step {step + 1}: ACTION - {tool_name}({kwargs})")
+
+                # Call the tool
+                observation = call_tool(tool_name, kwargs)
+
+                # Update info-density counters BEFORE truncating, so we count
+                # full result size (e.g. all vector hits, full sentiment row).
+                merge_info_density(info_density, tool_name, observation)
+
+                # Truncate long observations
+                if len(observation) > MAX_TOOL_OBSERVATION_CHARS:
+                    observation = observation[:MAX_TOOL_OBSERVATION_CHARS] + "\n... (truncated)"
+
+                print(f"  OBSERVATION: {observation[:150]}...")
+
+                # Add to conversation
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": f"OBSERVATION: {observation}"})
+
+                conversation_log.append({
+                    "step": step + 1,
+                    "role": "tool",
+                    "tool": tool_name,
+                    "args": kwargs,
+                    "result": observation[:500],
+                })
+            else:
+                # No action found, add response and ask agent to continue
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": "Continue your analysis. Use a tool or produce the FINAL REPORT."})
+
+            step += 1
+
+        # If we hit max steps, ask for final report
+        messages.append({"role": "user", "content": "You've gathered enough data. Produce the FINAL REPORT now."})
+        response_text = llm_call_fn(messages)
         conversation_log.append({
             "step": step + 1,
             "role": "assistant",
             "content": response_text,
         })
 
-        # Check if we have a final report
-        if "FINAL REPORT:" in response_text:
-            print(f"\nStep {step + 1}: FINAL REPORT generated")
-            return {
-                "conversation": conversation_log,
-                "final_response": response_text,
-                "steps": step + 1,
-            }
-
-        # Parse and execute action
-        tool_name, kwargs, action_line = parse_action(response_text)
-
-        if tool_name:
-            print(f"Step {step + 1}: ACTION - {tool_name}({kwargs})")
-
-            # Call the tool
-            observation = call_tool(tool_name, kwargs)
-
-            # Truncate long observations
-            if len(observation) > MAX_TOOL_OBSERVATION_CHARS:
-                observation = observation[:MAX_TOOL_OBSERVATION_CHARS] + "\n... (truncated)"
-
-            print(f"  OBSERVATION: {observation[:150]}...")
-
-            # Add to conversation
-            messages.append({"role": "assistant", "content": response_text})
-            messages.append({"role": "user", "content": f"OBSERVATION: {observation}"})
-
-            conversation_log.append({
-                "step": step + 1,
-                "role": "tool",
-                "tool": tool_name,
-                "args": kwargs,
-                "result": observation[:500],
-            })
-        else:
-            # No action found, add response and ask agent to continue
-            messages.append({"role": "assistant", "content": response_text})
-            messages.append({"role": "user", "content": "Continue your analysis. Use a tool or produce the FINAL REPORT."})
-
-        step += 1
-
-    # If we hit max steps, ask for final report
-    messages.append({"role": "user", "content": "You've gathered enough data. Produce the FINAL REPORT now."})
-    response_text = llm_call_fn(messages)
-    conversation_log.append({
-        "step": step + 1,
-        "role": "assistant",
-        "content": response_text,
-    })
+        info_density["context_tokens"] = sum(
+            int(r.get("input_tokens", 0) or 0) for r in call_records
+        )
 
     return {
         "conversation": conversation_log,
         "final_response": response_text,
         "steps": step + 1,
+        "info_density": info_density,
     }
 
 
