@@ -23,6 +23,9 @@ import json
 import requests
 import pandas as pd
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
