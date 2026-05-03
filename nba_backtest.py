@@ -51,6 +51,7 @@ np.random.seed(DEFAULT_RANDOM_SEED)
 
 def call_anthropic(messages):
     import anthropic
+    from nba_cost_logger import log_anthropic_response
     client = anthropic.Anthropic()
 
     system_msg = ""
@@ -67,11 +68,13 @@ def call_anthropic(messages):
         system=system_msg if system_msg else "You are an NBA betting analyst.",
         messages=conv_messages,
     )
+    log_anthropic_response("nba_backtest.py", response)
     return response.content[0].text
 
 
 def call_openai(messages):
     from openai import OpenAI
+    from nba_cost_logger import log_openai_response
     client = OpenAI()
 
     response = client.chat.completions.create(
@@ -79,6 +82,7 @@ def call_openai(messages):
         messages=messages,
         max_tokens=2500,
     )
+    log_openai_response("nba_backtest.py", response)
     return response.choices[0].message.content
 
 
