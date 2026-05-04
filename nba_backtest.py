@@ -676,6 +676,8 @@ def _run_method_with_parse_retry(method_name, runner_body):
                 "report is not a JSON object" in msg
                 or "no probability pair" in msg
                 or "missing key_factors" in msg
+                or "could not find home/away win probabilities" in msg
+                or "could not find" in msg
             )
             if not is_parse_failure:
                 raise
