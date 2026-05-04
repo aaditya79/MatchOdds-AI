@@ -205,7 +205,7 @@ def call_anthropic(messages):
         else:
             conv_messages.append(msg)
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=4096,
         system=system_msg if system_msg else "You are an NBA betting analyst.",
         messages=conv_messages,
