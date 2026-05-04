@@ -279,7 +279,7 @@ def call_anthropic(messages):
             conv_messages.append(msg)
 
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=2500,
         system=system_msg if system_msg else "You are an NBA betting analyst.",
         messages=conv_messages,
@@ -653,20 +653,57 @@ def _build_game_description(snapshot):
     return f"{away_name} vs {home_name}, {date_str}", home_name, away_name
 
 
+# Retry cap for cheaper Haiku-class models that occasionally produce a
+# response without a parseable JSON block. Each retry is a fresh agent
+# call (more API spend) so keep small.
+PARSE_RETRY_MAX_ATTEMPTS = 3
+
+
+def _run_method_with_parse_retry(method_name, runner_body):
+    """
+    Wrap an agent runner so a missing/malformed JSON report triggers a
+    fresh agent call instead of failing the whole game. Retries only on
+    parse failures from _normalize_agent_report; other errors propagate
+    immediately.
+    """
+    last_err = None
+    for attempt in range(1, PARSE_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return runner_body()
+        except ValueError as e:
+            msg = str(e)
+            is_parse_failure = (
+                "report is not a JSON object" in msg
+                or "no probability pair" in msg
+                or "missing key_factors" in msg
+            )
+            if not is_parse_failure:
+                raise
+            last_err = e
+            if attempt < PARSE_RETRY_MAX_ATTEMPTS:
+                print(
+                    f"    {method_name}: parse failed "
+                    f"(attempt {attempt}/{PARSE_RETRY_MAX_ATTEMPTS}), "
+                    f"retrying with a fresh agent run..."
+                )
+    raise last_err
+
+
 def run_single_agent_backtest(snapshot, llm_fn):
     """Invoke nba_agent.run_agent under an as_of_date freeze."""
     game_description, _home_name, _away_name = _build_game_description(snapshot)
     as_of_date = snapshot["game"]["date"]
 
-    with freeze_tool_as_of_date(as_of_date):
-        result = run_agent(game_description, llm_fn)
+    def _body():
+        with freeze_tool_as_of_date(as_of_date):
+            result = run_agent(game_description, llm_fn)
+        raw = result.get("final_response", "")
+        info_density = result.get("info_density") or _empty_backtest_info_density()
+        report_json = _extract_report_json(raw)
+        parsed = _normalize_agent_report(report_json, method_name="single_agent")
+        return parsed, raw, info_density
 
-    raw = result.get("final_response", "")
-    info_density = result.get("info_density") or _empty_backtest_info_density()
-
-    report_json = _extract_report_json(raw)
-    parsed = _normalize_agent_report(report_json, method_name="single_agent")
-    return parsed, raw, info_density
+    return _run_method_with_parse_retry("single_agent", _body)
 
 
 def run_cot_backtest(snapshot, llm_fn):
@@ -676,22 +713,23 @@ def run_cot_backtest(snapshot, llm_fn):
     home_abbr = snapshot["game"]["home_team"]
     away_abbr = snapshot["game"]["away_team"]
 
-    with freeze_tool_as_of_date(as_of_date):
-        result = run_cot_analysis(
-            home_abbr=home_abbr,
-            away_abbr=away_abbr,
-            home_name=home_name,
-            away_name=away_name,
-            game_description=game_description,
-            llm_call_fn=llm_fn,
-        )
+    def _body():
+        with freeze_tool_as_of_date(as_of_date):
+            result = run_cot_analysis(
+                home_abbr=home_abbr,
+                away_abbr=away_abbr,
+                home_name=home_name,
+                away_name=away_name,
+                game_description=game_description,
+                llm_call_fn=llm_fn,
+            )
+        raw = result.get("response", "")
+        info_density = result.get("info_density") or _empty_backtest_info_density()
+        report_json = _extract_report_json(raw)
+        parsed = _normalize_agent_report(report_json, method_name="chain_of_thought")
+        return parsed, raw, info_density
 
-    raw = result.get("response", "")
-    info_density = result.get("info_density") or _empty_backtest_info_density()
-
-    report_json = _extract_report_json(raw)
-    parsed = _normalize_agent_report(report_json, method_name="chain_of_thought")
-    return parsed, raw, info_density
+    return _run_method_with_parse_retry("chain_of_thought", _body)
 
 
 def run_multi_agent_backtest(snapshot, llm_fn):
@@ -699,15 +737,16 @@ def run_multi_agent_backtest(snapshot, llm_fn):
     game_description, _home_name, _away_name = _build_game_description(snapshot)
     as_of_date = snapshot["game"]["date"]
 
-    with freeze_tool_as_of_date(as_of_date):
-        result = run_full_debate(game_description, llm_fn)
+    def _body():
+        with freeze_tool_as_of_date(as_of_date):
+            result = run_full_debate(game_description, llm_fn)
+        raw = result.get("final_report", "")
+        info_density = result.get("info_density") or _empty_backtest_info_density()
+        report_json = _extract_report_json(raw)
+        parsed = _normalize_agent_report(report_json, method_name="multi_agent_debate")
+        return parsed, raw, info_density
 
-    raw = result.get("final_report", "")
-    info_density = result.get("info_density") or _empty_backtest_info_density()
-
-    report_json = _extract_report_json(raw)
-    parsed = _normalize_agent_report(report_json, method_name="multi_agent_debate")
-    return parsed, raw, info_density
+    return _run_method_with_parse_retry("multi_agent_debate", _body)
 
 
 # ============================================================
