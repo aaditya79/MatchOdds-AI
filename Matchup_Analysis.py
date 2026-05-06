@@ -1608,11 +1608,42 @@ def build_download_payload(mode, game_description, result, report_json):
     }
     return json.dumps(payload, indent=2)
 
+def _resolve_key(name):
+    """Get an API key from env, .env file, or st.secrets — whichever has it."""
+    # 1. environment variable (set via export or load_dotenv)
+    val = os.environ.get(name, "").strip()
+    if val:
+        return val
+    # 2. direct .env file read (handles cases where load_dotenv path differs)
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{name}="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        os.environ[name] = val
+                        return val
+    except Exception:
+        pass
+    # 3. Streamlit Cloud secrets
+    try:
+        val = st.secrets.get(name, "").strip()
+        if val:
+            os.environ[name] = val
+            return val
+    except Exception:
+        pass
+    return ""
+
+
 def get_llm_fn():
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    anthropic_key = _resolve_key("ANTHROPIC_API_KEY")
+    if anthropic_key:
         def call_anthropic(messages):
             import anthropic
-            client = anthropic.Anthropic()
+            client = anthropic.Anthropic(api_key=anthropic_key)
             system_msg = ""
             conv_messages = []
             for msg in messages:
@@ -1631,10 +1662,11 @@ def get_llm_fn():
 
         return call_anthropic, "Claude"
 
-    elif os.environ.get("OPENAI_API_KEY"):
+    openai_key = _resolve_key("OPENAI_API_KEY")
+    if openai_key:
         def call_openai(messages):
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(api_key=openai_key)
             response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=messages,
