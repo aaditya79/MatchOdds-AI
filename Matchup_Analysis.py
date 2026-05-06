@@ -885,25 +885,38 @@ def render_injury_summary(home_team, away_team):
             rows = []
 
             for inj in injuries[:8]:
-
-                status = inj.get("status", "Unknown")
-
-                player = inj.get("player", "Unknown")
-
+                player = inj.get("player", "")
+                status = inj.get("status", "")
                 pos = inj.get("position", "")
+                comment = inj.get("comment", "")
 
-                comment = str(inj.get("comment", ""))[:110]
+                # Skip rows where key fields are NaN/empty
+                import math
+                def _is_blank(v):
+                    if v is None: return True
+                    if isinstance(v, float) and math.isnan(v): return True
+                    return str(v).strip().lower() in ("", "nan", "none")
 
-                status = str(status) if status is not None else ""
+                if _is_blank(player) and _is_blank(status):
+                    continue
+
+                player = "Unknown" if _is_blank(player) else str(player)
+                status = "" if _is_blank(status) else str(status)
+                pos = "" if _is_blank(pos) else str(pos)
+                comment = "" if _is_blank(comment) else str(comment)[:110]
+
                 color = "#ff6b6b" if status.lower() == "out" else "#ffd166"
 
                 rows.append(
-
-                    f"<div style='margin-bottom:10px;'><strong style='color:{color};'>{status}</strong> · {player} <span style='color:rgba(247,251,255,0.7);'>({pos})</span><br><span style='color:rgba(247,251,255,0.72); font-size:0.88rem;'>{comment}</span></div>"
-
+                    f"<div style='margin-bottom:10px;'><strong style='color:{color};'>{status}</strong> · {player}"
+                    f"<span style='color:rgba(247,251,255,0.7);'>{' (' + pos + ')' if pos else ''}</span>"
+                    f"{'<br><span style=\"color:rgba(247,251,255,0.72); font-size:0.88rem;\">' + comment + '</span>' if comment else ''}</div>"
                 )
 
-            st.markdown(f"<div class='text-panel'>{''.join(rows)}</div>", unsafe_allow_html=True)
+            if rows:
+                st.markdown(f"<div class='text-panel'>{''.join(rows)}</div>", unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="text-panel">No reported injuries.</div>', unsafe_allow_html=True)
 
     # LEFT = AWAY, RIGHT = HOME
 
