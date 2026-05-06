@@ -26,6 +26,9 @@ import argparse
 import functools
 import pandas as pd
 import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Real reasoning entry points. The previous version of this file used local
 # static-prompt helpers and never invoked the live agent / tool stack — it was
@@ -981,8 +984,12 @@ def match_market_prob(odds_df, game_date, home_team, away_team):
 # MAIN
 # ============================================================
 
+ALL_METHODS = ["single_agent", "chain_of_thought", "multi_agent_debate"]
+
+
 def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER,
-                 min_games_history=DEFAULT_MIN_GAMES_HISTORY, disable_source=None):
+                 min_games_history=DEFAULT_MIN_GAMES_HISTORY, disable_source=None,
+                 methods=None):
     """
     Run the historical backtest.
 
@@ -996,7 +1003,11 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER,
             relevant snapshot keys are scrubbed. Output goes to
             data/backtest_ablation_<name>.csv (and a matching summary file)
             instead of the default backtest_predictions.csv.
+        methods: list of method names to run (default: all three). Pass
+            ["chain_of_thought"] to run CoT-only ablations at ~1/10th the cost.
     """
+    if methods is None:
+        methods = ALL_METHODS
     llm_fn, llm_name = get_llm_fn()
 
     print("=" * 60)
@@ -1045,11 +1056,12 @@ def run_backtest(n_games=DEFAULT_N_GAMES, season_filter=DEFAULT_SEASON_FILTER,
             print()
             print(f"[{i}/{len(test_games)}] {game_label}")
 
-            model_runs = [
+            all_model_runs = [
                 ("single_agent", run_single_agent_backtest),
                 ("chain_of_thought", run_cot_backtest),
                 ("multi_agent_debate", run_multi_agent_backtest),
             ]
+            model_runs = [(n, r) for n, r in all_model_runs if n in methods]
 
             for method_name, runner in model_runs:
                 try:
@@ -1176,10 +1188,25 @@ def main():
         "--ablate-all", action="store_true",
         help="Run a baseline + one backtest per source sequentially. Mutually exclusive with --disable-source.",
     )
+    parser.add_argument(
+        "--methods", type=str, default=None,
+        help=(
+            "Comma-separated list of methods to run: single_agent, chain_of_thought, "
+            "multi_agent_debate. Default: all three. Use --methods chain_of_thought for "
+            "cheap CoT-only ablations (~1/10th the cost of a full run)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.ablate_all and args.disable_source:
         parser.error("--ablate-all and --disable-source are mutually exclusive.")
+
+    methods = None
+    if args.methods:
+        methods = [m.strip() for m in args.methods.split(",")]
+        invalid = [m for m in methods if m not in ALL_METHODS]
+        if invalid:
+            parser.error(f"Unknown method(s): {invalid}. Choose from {ALL_METHODS}.")
 
     if args.ablate_all:
         sources = sorted(ABLATION_SOURCES.keys())
@@ -1191,6 +1218,7 @@ def main():
                 season_filter=args.season,
                 min_games_history=args.min_games_history,
                 disable_source=source,
+                methods=methods,
             )
         return
 
@@ -1199,6 +1227,7 @@ def main():
         season_filter=args.season,
         min_games_history=args.min_games_history,
         disable_source=args.disable_source,
+        methods=methods,
     )
 
 

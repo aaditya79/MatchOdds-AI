@@ -135,31 +135,35 @@ Split across team: each member scores ~10 reports.
 
 ## 5. Results
 
-_(To be filled in as eval runs complete. Each subsection will populate from its respective CSV in `data/`.)_
-
 ### 5.1 Cost & resource usage
 *Source: `data/llm_calls.jsonl`*
 
 | Metric | Value |
 |---|---|
-| Model used | _(claude-haiku-4-5-20251001)_ |
-| Total LLM calls | _TBD_ |
-| Total cost (USD) | _TBD_ |
-| Avg cost per game | _TBD_ |
-| Avg cost per method per game | _single TBD / cot TBD / multi TBD_ |
-| Total runtime | _TBD_ |
+| Model used | claude-haiku-4-5-20251001 |
+| Total LLM calls | 8,356 |
+| Total cost (USD) | $26.09 |
+| Avg cost per game (all 3 methods) | $0.20 |
+| Approx cost per method per game | single ~$0.03 / CoT ~$0.01 / multi-agent ~$0.15 |
+| Total runtime | ~17h wall time (overnight) |
+
+Multi-agent debate accounts for ~75% of total cost due to 3 agents × 2 debate rounds × multiple tool calls per round. CoT is cheapest at ~1 LLM call per game.
 
 ### 5.2 Main comparison: single agent vs CoT vs multi-agent debate (RQ2)
 *Source: `data/backtest_summary.csv`, `data/backtest_predictions.csv`*
 
 | Method | Games | Brier ↓ | Log loss ↓ | ECE ↓ | Accuracy ↑ | F1 ↑ |
 |---|---|---|---|---|---|---|
-| Single agent | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| CoT baseline | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| Multi-agent debate | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| Market baseline | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| **CoT baseline** | **132** | **0.228** | **0.646** | **0.068** | **61.4%** | **0.653** |
+| Multi-agent debate | 132 | 0.283 | 0.771 | 0.167 | 52.3% | 0.618 |
+| Single agent | 125 | 0.297 | 0.811 | 0.205 | 52.8% | 0.638 |
+| Market baseline | N/A | N/A | N/A | N/A | N/A | N/A |
 
-**Headline finding:** _TBD (does multi-agent debate beat the simpler approaches?)_
+Market baseline unavailable: historical Kaggle odds CSV was not added to the dataset; 0/389 prediction rows have market implied probabilities.
+
+A random 50/50 predictor yields a Brier score of 0.250. CoT (0.228) outperforms random; multi-agent (0.283) and single agent (0.297) perform below random on this metric, though all three methods produce probabilistic outputs with partial signal (Brier < 0.30).
+
+**Headline finding:** CoT wins on all metrics. Pre-gathering all evidence upfront and reasoning once outperforms both iterative tool-calling (single agent) and multi-agent debate. This is a counter-intuitive result — more reasoning complexity did not translate to better predictions. Multi-agent debate in particular shows poor calibration (ECE 0.167 vs CoT's 0.068), suggesting agents anchor on each other's positions and amplify miscalibration across rounds.
 
 ### 5.3 Information density vs prediction quality (RQ1)
 *Source: `data/backtest_predictions.csv` (info_density_* columns)*
@@ -168,57 +172,69 @@ For each info-density signal, the correlation with Brier score:
 
 | Signal | Pearson r with Brier | Spearman r with Brier | Notes |
 |---|---|---|---|
-| youtube_comments | _TBD_ | _TBD_ | _TBD_ |
-| news_articles | _TBD_ | _TBD_ | _TBD_ |
-| vector_hits | _TBD_ | _TBD_ | _TBD_ |
-| context_tokens | _TBD_ | _TBD_ | _TBD_ |
+| youtube_comments | 0.000 | 0.000 | All zeros — no historical YouTube snapshots available |
+| news_articles | 0.000 | 0.000 | All zeros — news sentiment has no date column for backtest filtering |
+| vector_hits | -0.030 | 0.000 | Near-zero; avg 8.4 hits/game with low variance |
+| context_tokens | +0.058 | +0.114 | Weak positive: more context slightly correlates with worse Brier |
 
-**Headline finding:** _TBD (is more info correlated with better predictions, or does the agent do better on lower-info games?)_
+**Headline finding:** More public information does not improve prediction quality — if anything, higher-context games produce marginally worse predictions. This likely reflects that high-context games are high-profile matchups (playoffs, national TV) where outcomes are more unpredictable, not that context itself hurts reasoning.
 
 Game-profile breakdown (top vs bottom quartile of context_tokens):
-- High-info Brier: _TBD_
-- Low-info Brier: _TBD_
-- Delta: _TBD_
+- High-info Brier (top quartile, ≥75th pct tokens): **0.262**
+- Low-info Brier (bottom quartile, ≤25th pct tokens): **0.239**
+- Delta: +0.024 (high-info games are harder to predict)
+
+Note: YouTube and news signals are effectively zero across all backtest games because historical snapshots were not available (see Section 6 Limitations). The RQ1 analysis is therefore driven entirely by vector_hits and context_tokens.
 
 ### 5.4 Ablation: per-source impact (RQ3)
 *Source: `data/backtest_ablation_<source>.csv` (one per disabled source)*
 
+CoT-only ablations. Baseline CoT Brier = 0.228.
+
 | Disabled source | Brier delta vs baseline | Significance |
 |---|---|---|
-| youtube | _TBD_ | _TBD_ |
-| news | _TBD_ | _TBD_ |
-| odds | _TBD_ | _TBD_ |
-| injuries | _TBD_ | _TBD_ |
-| vector_store | _TBD_ | _TBD_ |
-| h2h | _TBD_ | _TBD_ |
-| stats | _TBD_ | _TBD_ |
+| youtube | _pending_ | _pending_ |
+| news | _pending_ | _pending_ |
+| odds | _pending_ | _pending_ |
+| injuries | _pending_ | _pending_ |
+| vector_store | _pending_ | _pending_ |
+| h2h | _pending_ | _pending_ |
+| stats | _pending_ | _pending_ |
 
-**Headline finding:** _TBD (which sources matter most?)_
+**Headline finding:** _Pending ablation run completion. Expected: stats and h2h will show largest deltas (only sources with real historical data); youtube/news/odds/injuries expected near-zero delta since they return no data for historical games._
 
 ### 5.5 Manual report quality scoring
 *Source: `data/report_quality_scores.csv` (filled by team scoring)*
 
 | Criterion | Mean (1-5) | Std | Top method |
 |---|---|---|---|
-| Factual accuracy | _TBD_ | _TBD_ | _TBD_ |
-| Completeness | _TBD_ | _TBD_ | _TBD_ |
-| Reasoning quality | _TBD_ | _TBD_ | _TBD_ |
-| Actionability | _TBD_ | _TBD_ | _TBD_ |
+| Factual accuracy | _pending_ | _pending_ | _pending_ |
+| Completeness | _pending_ | _pending_ | _pending_ |
+| Reasoning quality | _pending_ | _pending_ | _pending_ |
+| Actionability | _pending_ | _pending_ | _pending_ |
 
 ### 5.6 Calibration
 *Source: `data/backtest_calibration.csv`*
 
-10-bin calibration curves per method. Diagonal = perfect calibration. ECE summary above in 5.2.
+5-bin calibration curves. Diagonal = perfect calibration. ECE summarized in 5.2.
+
+**CoT** is well-calibrated in the middle bins (predicted 0.50 → actual 0.54, gap 0.04; predicted 0.68 → actual 0.71, gap 0.03). Underestimates at the extremes: in the 0–0.2 bin (6 games), predicted 0.13 but actual win rate was 0.33.
+
+**Multi-agent debate** shows severe miscalibration at high confidence: in the 0.8–1.0 bin (5 games), it predicted 0.84 home win probability but the actual home win rate was only 0.20. This indicates multi-agent debate is overconfident when agents converge on a position.
+
+**Single agent** is similarly overconfident at high predictions: 0.8–1.0 bin (12 games) predicted 0.88 but actual rate 0.67.
 
 ### 5.7 Secondary breakdowns
 *Per proposal: by back-to-back games, star player absences, home/away*
 
+Back-to-back and star-absence flags are not tracked in the backtest output CSV. The backtest harness computes game-level predictions but does not propagate schedule context (B2B, rest days) into the predictions file. This is a known gap — these breakdowns are listed as future work.
+
 | Slice | Games | Best method | Brier |
 |---|---|---|---|
-| Back-to-back games | _TBD_ | _TBD_ | _TBD_ |
-| Non-back-to-back | _TBD_ | _TBD_ | _TBD_ |
-| Home games | _TBD_ | _TBD_ | _TBD_ |
-| Away games | _TBD_ | _TBD_ | _TBD_ |
+| Back-to-back games | not tracked | — | — |
+| Non-back-to-back | not tracked | — | — |
+| High-profile games (top quartile context tokens) | 97 | CoT | 0.262 |
+| Low-profile games (bottom quartile context tokens) | 97 | CoT | 0.239 |
 
 ---
 
@@ -284,15 +300,16 @@ cp .env.example .env  # fill in ANTHROPIC_API_KEY, ODDS_API_KEY, YOUTUBE_API_KEY
 .venv/bin/python nba_news_pipeline.py
 # (injury pipeline is current-state-only; backtest doesn't use it)
 
-# Smoke test (~3-5 min, ~$0.30)
+# Smoke test (~5 min, ~$0.20 with cache)
 .venv/bin/python nba_backtest.py --n-games 5 --season 2024-25
 
-# Full eval (~30-60 min, ~$10)
-.venv/bin/python nba_backtest.py --n-games 150 --season 2024-25
+# Full eval (~17h wall time, ~$26 for all 3 methods)
+nohup .venv/bin/python -u nba_backtest.py --n-games 150 --season 2024-25 > backtest_full.log 2>&1 &
 
-# Ablations (~$2 each, run all 7 with --ablate-all if implemented, otherwise:)
+# Ablations — CoT-only to control cost (~$3-5 total for all 7)
 for src in youtube news odds injuries vector_store h2h stats; do
-  .venv/bin/python nba_backtest.py --n-games 150 --season 2024-25 --disable-source "$src"
+  .venv/bin/python nba_backtest.py --n-games 150 --season 2024-25 \
+    --disable-source "$src" --methods chain_of_thought
 done
 
 # Streamlit demo
