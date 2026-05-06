@@ -3,6 +3,19 @@ import io
 import json
 import html
 import time
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Streamlit Cloud stores secrets in st.secrets — pull them into os.environ
+# so the rest of the app (which reads os.environ) finds them.
+try:
+    import streamlit as st
+    for _key in ("ANTHROPIC_API_KEY", "ODDS_API_KEY", "YOUTUBE_API_KEY"):
+        if _key not in os.environ and hasattr(st, "secrets") and _key in st.secrets:
+            os.environ[_key] = st.secrets[_key]
+except Exception:
+    pass
 import contextlib
 import streamlit as st
 import pandas as pd
@@ -872,24 +885,38 @@ def render_injury_summary(home_team, away_team):
             rows = []
 
             for inj in injuries[:8]:
-
-                status = inj.get("status", "Unknown")
-
-                player = inj.get("player", "Unknown")
-
+                player = inj.get("player", "")
+                status = inj.get("status", "")
                 pos = inj.get("position", "")
+                comment = inj.get("comment", "")
 
-                comment = str(inj.get("comment", ""))[:110]
+                # Skip rows where key fields are NaN/empty
+                import math
+                def _is_blank(v):
+                    if v is None: return True
+                    if isinstance(v, float) and math.isnan(v): return True
+                    return str(v).strip().lower() in ("", "nan", "none")
+
+                if _is_blank(player) and _is_blank(status):
+                    continue
+
+                player = "Unknown" if _is_blank(player) else str(player)
+                status = "" if _is_blank(status) else str(status)
+                pos = "" if _is_blank(pos) else str(pos)
+                comment = "" if _is_blank(comment) else str(comment)[:110]
 
                 color = "#ff6b6b" if status.lower() == "out" else "#ffd166"
 
                 rows.append(
-
-                    f"<div style='margin-bottom:10px;'><strong style='color:{color};'>{status}</strong> · {player} <span style='color:rgba(247,251,255,0.7);'>({pos})</span><br><span style='color:rgba(247,251,255,0.72); font-size:0.88rem;'>{comment}</span></div>"
-
+                    f"<div style='margin-bottom:10px;'><strong style='color:{color};'>{status}</strong> · {player}"
+                    f"<span style='color:rgba(247,251,255,0.7);'>{' (' + pos + ')' if pos else ''}</span>"
+                    f"{'<br><span style=\"color:rgba(247,251,255,0.72); font-size:0.88rem;\">' + comment + '</span>' if comment else ''}</div>"
                 )
 
-            st.markdown(f"<div class='text-panel'>{''.join(rows)}</div>", unsafe_allow_html=True)
+            if rows:
+                st.markdown(f"<div class='text-panel'>{''.join(rows)}</div>", unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="text-panel">No reported injuries.</div>', unsafe_allow_html=True)
 
     # LEFT = AWAY, RIGHT = HOME
 
@@ -987,6 +1014,142 @@ def get_prediction_block(report_json):
     away_prob = pred.get("away_win_prob", 0.5)
     confidence = pred.get("confidence", "Medium")
     return pred, home_prob, away_prob, confidence
+
+def render_market_divergence(report_json, home_team, away_team):
+    """Show bookmaker consensus odds and flag divergence vs agent probability."""
+    try:
+        odds_df = pd.read_csv("data/odds_live.csv")
+        odds_df = odds_df[odds_df["MARKET"] == "h2h"].copy()
+    except Exception:
+        return
+
+    home_rows = odds_df[odds_df["HOME_TEAM"].str.lower().str.contains(home_team.split()[-1].lower(), na=False)]
+    if home_rows.empty:
+        return
+
+    # Compute market consensus: average implied home/away probability across books
+    def american_to_prob(odds_val):
+        try:
+            o = float(odds_val)
+            return 100 / (o + 100) if o > 0 else abs(o) / (abs(o) + 100)
+        except Exception:
+            return None
+
+    home_probs, away_probs = [], []
+    for _, row in home_rows.iterrows():
+        try:
+            h = american_to_prob(row.get("HOME_ODDS") or row.get("PRICE"))
+            a = american_to_prob(row.get("AWAY_ODDS"))
+            if h and a:
+                total = h + a
+                home_probs.append(h / total)
+                away_probs.append(a / total)
+        except Exception:
+            continue
+
+    if not home_probs:
+        return
+
+    market_home = sum(home_probs) / len(home_probs)
+    market_away = sum(away_probs) / len(away_probs)
+
+    _, agent_home, agent_away, _ = get_prediction_block(report_json)
+    if not isinstance(agent_home, (int, float)):
+        return
+
+    divergence = abs(agent_home - market_home)
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Market Odds Comparison</div>', unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric(f"{home_team} — Agent", f"{agent_home:.0%}")
+    with c2:
+        st.metric(f"{home_team} — Market consensus", f"{market_home:.0%}",
+                  delta=f"{agent_home - market_home:+.0%} vs market")
+    with c3:
+        st.metric("Bookmakers sampled", str(len(home_probs)))
+
+    if divergence >= 0.05:
+        direction = "higher" if agent_home > market_home else "lower"
+        st.warning(
+            f"⚡ **Divergence detected ({divergence:.0%}):** The agent's home win probability is "
+            f"{divergence:.0%} {direction} than the market consensus. "
+            f"This may indicate an edge or a model blind spot worth investigating."
+        )
+    else:
+        st.success(f"Agent and market are aligned (divergence {divergence:.0%} < 5% threshold).")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_similar_games(home_abbr, away_abbr, home_team, away_team):
+    """Surface top similar historical matchups from the vector store."""
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Similar Past Matchups</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtle" style="margin-bottom:12px;">'
+        'Historical games retrieved from ChromaDB based on semantic similarity to this matchup context. '
+        'Used by the agent to ground predictions in real precedent.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    try:
+        raw_home = tool_search_similar_games(
+            query_text=f"{home_abbr} home game recent form matchup",
+            team=home_abbr, n_results=3,
+        )
+        raw_away = tool_search_similar_games(
+            query_text=f"{away_abbr} away game recent form matchup",
+            team=away_abbr, n_results=2,
+        )
+        hits = []
+        for raw in [raw_home, raw_away]:
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        hits.extend(parsed)
+                except Exception:
+                    pass
+            elif isinstance(raw, list):
+                hits.extend(raw)
+
+        if not hits:
+            st.info("No similar games found in the vector store.")
+            st.markdown('</div>', unsafe_allow_html=True)
+            return
+
+        seen = set()
+        unique_hits = []
+        for h in hits:
+            key = h.get("game_description", "")[:60]
+            if key not in seen:
+                seen.add(key)
+                unique_hits.append(h)
+
+        for hit in unique_hits[:5]:
+            desc = hit.get("game_description", "Unknown game")
+            outcome = hit.get("outcome", "")
+            similarity = hit.get("similarity_score") or hit.get("distance")
+            outcome_emoji = "✅" if str(outcome).lower() in ("w", "win", "1") else "❌" if str(outcome).lower() in ("l", "loss", "0") else "—"
+            sim_str = f" · similarity {float(similarity):.3f}" if similarity is not None else ""
+            st.markdown(
+                f'<div style="padding:8px 12px;margin-bottom:8px;background:rgba(255,255,255,0.07);'
+                f'border-radius:10px;border-left:3px solid rgba(139,193,255,0.6);">'
+                f'<span style="font-size:0.88rem;color:#f7fbff;">{outcome_emoji} {desc}</span>'
+                f'<span style="font-size:0.78rem;color:rgba(247,251,255,0.55);">{sim_str}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    except Exception as e:
+        st.caption(f"Similar games unavailable: {e}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
 def render_prediction_visuals(report_json, home_team, away_team):
     _, home_prob, away_prob, confidence = get_prediction_block(report_json)
@@ -1336,17 +1499,12 @@ def render_analysis_trace(trace_text, mode):
     if not trace_text or not trace_text.strip():
         return
 
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Analysis Trace</div>', unsafe_allow_html=True)
-    st.markdown(
-        """
-        <div class="subtle" style="margin-bottom:12px;">
-            This shows the model's visible step-by-step workflow: data gathering, tool calls, debate rounds, and final synthesis.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    with st.expander("View Analysis Trace", expanded=False):
+        st.caption("Step-by-step workflow: data gathering, tool calls, debate rounds, and final synthesis.")
+        st.code(trace_text.strip(), language=None)
+        return
 
+    # Legacy rendering below (unreachable, kept for reference)
     lines = [clean_trace_line(line) for line in trace_text.splitlines()]
     lines = [line for line in lines if line]
 
@@ -1459,11 +1617,42 @@ def build_download_payload(mode, game_description, result, report_json):
     }
     return json.dumps(payload, indent=2)
 
+def _resolve_key(name):
+    """Get an API key from env, .env file, or st.secrets — whichever has it."""
+    # 1. environment variable (set via export or load_dotenv)
+    val = os.environ.get(name, "").strip()
+    if val:
+        return val
+    # 2. direct .env file read (handles cases where load_dotenv path differs)
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{name}="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        os.environ[name] = val
+                        return val
+    except Exception:
+        pass
+    # 3. Streamlit Cloud secrets
+    try:
+        val = st.secrets.get(name, "").strip()
+        if val:
+            os.environ[name] = val
+            return val
+    except Exception:
+        pass
+    return ""
+
+
 def get_llm_fn():
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    anthropic_key = _resolve_key("ANTHROPIC_API_KEY")
+    if anthropic_key:
         def call_anthropic(messages):
             import anthropic
-            client = anthropic.Anthropic()
+            client = anthropic.Anthropic(api_key=anthropic_key)
             system_msg = ""
             conv_messages = []
             for msg in messages:
@@ -1482,10 +1671,11 @@ def get_llm_fn():
 
         return call_anthropic, "Claude"
 
-    elif os.environ.get("OPENAI_API_KEY"):
+    openai_key = _resolve_key("OPENAI_API_KEY")
+    if openai_key:
         def call_openai(messages):
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(api_key=openai_key)
             response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=messages,
@@ -1796,7 +1986,9 @@ def main():
             if report_json:
                 live_trace_placeholder.empty()
                 render_prediction_visuals(report_json, home_team, away_team)
+                render_market_divergence(report_json, home_team, away_team)
                 render_key_factors(report_json.get("key_factors", []))
+                render_similar_games(home_abbr, away_abbr, home_team, away_team)
                 render_reasoning_value(report_json)
                 render_final_prediction(report_json, home_team, away_team)
                 render_analysis_trace(trace_text, mode)
@@ -1837,7 +2029,9 @@ def main():
             if report_json:
                 live_trace_placeholder.empty()
                 render_prediction_visuals(report_json, home_team, away_team)
+                render_market_divergence(report_json, home_team, away_team)
                 render_key_factors(report_json.get("key_factors", []))
+                render_similar_games(home_abbr, away_abbr, home_team, away_team)
                 render_reasoning_value(report_json)
                 render_final_prediction(report_json, home_team, away_team)
                 render_analysis_trace(trace_text, mode)
@@ -1875,7 +2069,9 @@ def main():
             if report_json:
                 live_trace_placeholder.empty()
                 render_prediction_visuals(report_json, home_team, away_team)
+                render_market_divergence(report_json, home_team, away_team)
                 render_key_factors(report_json.get("key_factors", []))
+                render_similar_games(home_abbr, away_abbr, home_team, away_team)
                 render_agent_breakdown(result.get("agent_analyses", {}))
                 render_agreement(report_json)
                 render_reasoning_value(report_json)

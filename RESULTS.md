@@ -204,14 +204,22 @@ CoT-only ablations. Baseline CoT Brier = 0.228.
 **Headline finding:** _Pending ablation run completion. Expected: stats and h2h will show largest deltas (only sources with real historical data); youtube/news/odds/injuries expected near-zero delta since they return no data for historical games._
 
 ### 5.5 Manual report quality scoring
-*Source: `data/report_quality_scores.csv` (filled by team scoring)*
+*Source: `data/report_quality_scoring.md` — 7 games × 3 methods = 21 reports, scored on 1–5 Likert scale*
 
-| Criterion | Mean (1-5) | Std | Top method |
-|---|---|---|---|
-| Factual accuracy | _pending_ | _pending_ | _pending_ |
-| Completeness | _pending_ | _pending_ | _pending_ |
-| Reasoning quality | _pending_ | _pending_ | _pending_ |
-| Actionability | _pending_ | _pending_ | _pending_ |
+**Per-method averages:**
+
+| Criterion | CoT | Single Agent | Multi-Agent | Overall mean | Overall std |
+|---|---|---|---|---|---|
+| Factual accuracy | **4.29** | 3.71 | 3.14 | 3.71 | 0.70 |
+| Completeness | **4.14** | 3.71 | 4.00 | 3.95 | 0.58 |
+| Reasoning quality | **4.29** | 2.14 | 2.43 | 2.95 | 1.29 |
+| Actionability | **4.14** | 2.00 | 2.29 | 2.81 | 1.40 |
+
+CoT scores highest on all four criteria. The most differentiating criterion is **reasoning quality** (CoT 4.29 vs Single 2.14 vs Multi 2.43) — a 2-point gap driven by a systemic failure in both reactive methods: their text-level reasoning often correctly identified the favored team, but the final JSON probability was frequently inverted relative to the stated logic (home/away confusion in the structured output format). CoT avoids this because it produces a single coherent response with no intermediate tool-call JSON parsing.
+
+Multi-agent debate scores well on **completeness** (4.00) due to the three-perspective structure surfacing more factors, but this breadth does not translate into better reasoning or actionability.
+
+**Actionability** shows the largest variance (std 1.40) — CoT reports were consistently clear and usable; single agent and multi-agent reports were often self-contradictory, making them actively misleading to a bettor.
 
 ### 5.6 Calibration
 *Source: `data/backtest_calibration.csv`*
