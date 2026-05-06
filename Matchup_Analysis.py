@@ -988,6 +988,142 @@ def get_prediction_block(report_json):
     confidence = pred.get("confidence", "Medium")
     return pred, home_prob, away_prob, confidence
 
+def render_market_divergence(report_json, home_team, away_team):
+    """Show bookmaker consensus odds and flag divergence vs agent probability."""
+    try:
+        odds_df = pd.read_csv("data/odds_live.csv")
+        odds_df = odds_df[odds_df["MARKET"] == "h2h"].copy()
+    except Exception:
+        return
+
+    home_rows = odds_df[odds_df["HOME_TEAM"].str.lower().str.contains(home_team.split()[-1].lower(), na=False)]
+    if home_rows.empty:
+        return
+
+    # Compute market consensus: average implied home/away probability across books
+    def american_to_prob(odds_val):
+        try:
+            o = float(odds_val)
+            return 100 / (o + 100) if o > 0 else abs(o) / (abs(o) + 100)
+        except Exception:
+            return None
+
+    home_probs, away_probs = [], []
+    for _, row in home_rows.iterrows():
+        try:
+            h = american_to_prob(row.get("HOME_ODDS") or row.get("PRICE"))
+            a = american_to_prob(row.get("AWAY_ODDS"))
+            if h and a:
+                total = h + a
+                home_probs.append(h / total)
+                away_probs.append(a / total)
+        except Exception:
+            continue
+
+    if not home_probs:
+        return
+
+    market_home = sum(home_probs) / len(home_probs)
+    market_away = sum(away_probs) / len(away_probs)
+
+    _, agent_home, agent_away, _ = get_prediction_block(report_json)
+    if not isinstance(agent_home, (int, float)):
+        return
+
+    divergence = abs(agent_home - market_home)
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Market Odds Comparison</div>', unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric(f"{home_team} — Agent", f"{agent_home:.0%}")
+    with c2:
+        st.metric(f"{home_team} — Market consensus", f"{market_home:.0%}",
+                  delta=f"{agent_home - market_home:+.0%} vs market")
+    with c3:
+        st.metric("Bookmakers sampled", str(len(home_probs)))
+
+    if divergence >= 0.05:
+        direction = "higher" if agent_home > market_home else "lower"
+        st.warning(
+            f"⚡ **Divergence detected ({divergence:.0%}):** The agent's home win probability is "
+            f"{divergence:.0%} {direction} than the market consensus. "
+            f"This may indicate an edge or a model blind spot worth investigating."
+        )
+    else:
+        st.success(f"Agent and market are aligned (divergence {divergence:.0%} < 5% threshold).")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_similar_games(home_abbr, away_abbr, home_team, away_team):
+    """Surface top similar historical matchups from the vector store."""
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Similar Past Matchups</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtle" style="margin-bottom:12px;">'
+        'Historical games retrieved from ChromaDB based on semantic similarity to this matchup context. '
+        'Used by the agent to ground predictions in real precedent.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    try:
+        raw_home = tool_search_similar_games(
+            query_text=f"{home_abbr} home game recent form matchup",
+            team=home_abbr, n_results=3,
+        )
+        raw_away = tool_search_similar_games(
+            query_text=f"{away_abbr} away game recent form matchup",
+            team=away_abbr, n_results=2,
+        )
+        hits = []
+        for raw in [raw_home, raw_away]:
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        hits.extend(parsed)
+                except Exception:
+                    pass
+            elif isinstance(raw, list):
+                hits.extend(raw)
+
+        if not hits:
+            st.info("No similar games found in the vector store.")
+            st.markdown('</div>', unsafe_allow_html=True)
+            return
+
+        seen = set()
+        unique_hits = []
+        for h in hits:
+            key = h.get("game_description", "")[:60]
+            if key not in seen:
+                seen.add(key)
+                unique_hits.append(h)
+
+        for hit in unique_hits[:5]:
+            desc = hit.get("game_description", "Unknown game")
+            outcome = hit.get("outcome", "")
+            similarity = hit.get("similarity_score") or hit.get("distance")
+            outcome_emoji = "✅" if str(outcome).lower() in ("w", "win", "1") else "❌" if str(outcome).lower() in ("l", "loss", "0") else "—"
+            sim_str = f" · similarity {float(similarity):.3f}" if similarity is not None else ""
+            st.markdown(
+                f'<div style="padding:8px 12px;margin-bottom:8px;background:rgba(255,255,255,0.07);'
+                f'border-radius:10px;border-left:3px solid rgba(139,193,255,0.6);">'
+                f'<span style="font-size:0.88rem;color:#f7fbff;">{outcome_emoji} {desc}</span>'
+                f'<span style="font-size:0.78rem;color:rgba(247,251,255,0.55);">{sim_str}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    except Exception as e:
+        st.caption(f"Similar games unavailable: {e}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
 def render_prediction_visuals(report_json, home_team, away_team):
     _, home_prob, away_prob, confidence = get_prediction_block(report_json)
     home_pct = int(round((home_prob if isinstance(home_prob, (int, float)) else 0.5) * 100))
@@ -1796,7 +1932,9 @@ def main():
             if report_json:
                 live_trace_placeholder.empty()
                 render_prediction_visuals(report_json, home_team, away_team)
+                render_market_divergence(report_json, home_team, away_team)
                 render_key_factors(report_json.get("key_factors", []))
+                render_similar_games(home_abbr, away_abbr, home_team, away_team)
                 render_reasoning_value(report_json)
                 render_final_prediction(report_json, home_team, away_team)
                 render_analysis_trace(trace_text, mode)
@@ -1837,7 +1975,9 @@ def main():
             if report_json:
                 live_trace_placeholder.empty()
                 render_prediction_visuals(report_json, home_team, away_team)
+                render_market_divergence(report_json, home_team, away_team)
                 render_key_factors(report_json.get("key_factors", []))
+                render_similar_games(home_abbr, away_abbr, home_team, away_team)
                 render_reasoning_value(report_json)
                 render_final_prediction(report_json, home_team, away_team)
                 render_analysis_trace(trace_text, mode)
@@ -1875,7 +2015,9 @@ def main():
             if report_json:
                 live_trace_placeholder.empty()
                 render_prediction_visuals(report_json, home_team, away_team)
+                render_market_divergence(report_json, home_team, away_team)
                 render_key_factors(report_json.get("key_factors", []))
+                render_similar_games(home_abbr, away_abbr, home_team, away_team)
                 render_agent_breakdown(result.get("agent_analyses", {}))
                 render_agreement(report_json)
                 render_reasoning_value(report_json)

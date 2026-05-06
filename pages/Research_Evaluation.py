@@ -593,6 +593,203 @@ def render_disagreement_section(pred_df):
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+def render_info_density_section(pred_df):
+    if pred_df.empty:
+        return
+
+    density_cols = [c for c in [
+        "info_density_context_tokens",
+        "info_density_vector_hits",
+        "info_density_youtube_comments",
+        "info_density_news_articles",
+    ] if c in pred_df.columns]
+
+    if not density_cols or "brier_score" not in pred_df.columns:
+        return
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Information Density vs Prediction Quality (RQ1)</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtle" style="margin-bottom:12px;">'
+        'Does having more pre-game information improve prediction quality? '
+        'Each point is one game-method prediction. Lower Brier score = better. '
+        'A positive correlation means more info → worse predictions (harder games). '
+        'A negative correlation means more info → better predictions.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    signal_labels = {
+        "info_density_context_tokens": "Context Tokens (total input size)",
+        "info_density_vector_hits": "Vector Store Hits (similar past games)",
+        "info_density_youtube_comments": "YouTube Comments",
+        "info_density_news_articles": "News Articles",
+    }
+
+    x_col = st.selectbox(
+        "Info density signal",
+        density_cols,
+        format_func=lambda c: signal_labels.get(c, c),
+        key="density_x_col",
+    )
+
+    plot_df = pred_df[["method", x_col, "brier_score"]].dropna().copy()
+    if plot_df.empty or plot_df[x_col].nunique() < 3:
+        st.info("Not enough variation in this signal to plot.")
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    colors = {"chain_of_thought": "#39d98a", "single_agent": "#8bc1ff", "multi_agent_debate": "#ffd166"}
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.patch.set_facecolor("#1e1e1e")
+    ax.set_facecolor("#1e1e1e")
+
+    for method, g in plot_df.groupby("method"):
+        ax.scatter(
+            g[x_col], g["brier_score"],
+            alpha=0.55, s=28,
+            color=colors.get(method, "#aaa"),
+            label=method_display_name(method),
+        )
+
+    # Pearson r annotation
+    import numpy as np
+    xv = plot_df[x_col].values.astype(float)
+    yv = plot_df["brier_score"].values.astype(float)
+    if xv.std() > 0 and yv.std() > 0:
+        r = float(np.corrcoef(xv, yv)[0, 1])
+        ax.annotate(
+            f"Pearson r = {r:+.3f}",
+            xy=(0.97, 0.05), xycoords="axes fraction",
+            ha="right", fontsize=10, color="white",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#1e1e1e", edgecolor="white", alpha=0.7),
+        )
+
+    ax.tick_params(colors="white")
+    ax.title.set_color("white")
+    ax.yaxis.label.set_color("white")
+    ax.xaxis.label.set_color("white")
+    for spine in ax.spines.values():
+        spine.set_color("#555")
+    legend = ax.legend()
+    plt.setp(legend.get_texts(), color="white")
+    legend.get_frame().set_facecolor("#1e1e1e")
+    legend.get_frame().set_edgecolor("#555")
+
+    ax.set_xlabel(signal_labels.get(x_col, x_col))
+    ax.set_ylabel("Brier Score (lower = better)")
+    ax.set_title("Info Density vs Prediction Quality")
+
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    # High vs low info quartile summary
+    q25 = plot_df[x_col].quantile(0.25)
+    q75 = plot_df[x_col].quantile(0.75)
+    hi_brier = plot_df[plot_df[x_col] >= q75]["brier_score"].mean()
+    lo_brier = plot_df[plot_df[x_col] <= q25]["brier_score"].mean()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Low-info Brier (≤25th pct)", f"{lo_brier:.4f}")
+    with c2:
+        st.metric("High-info Brier (≥75th pct)", f"{hi_brier:.4f}")
+    with c3:
+        delta = hi_brier - lo_brier
+        st.metric("Delta (high − low)", f"{delta:+.4f}", help="Positive = high-info games are harder to predict")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_ablation_section():
+    import glob
+    ablation_files = glob.glob("data/backtest_ablation_*_summary.csv")
+    if not ablation_files:
+        return
+
+    baseline_df = load_csv_if_exists("data/backtest_summary.csv")
+    if baseline_df.empty:
+        return
+
+    baseline_cot = baseline_df[baseline_df["method"] == "chain_of_thought"]
+    if baseline_cot.empty:
+        return
+    baseline_brier = float(baseline_cot["brier_score"].iloc[0])
+
+    rows = []
+    for fpath in sorted(ablation_files):
+        source = os.path.basename(fpath).replace("backtest_ablation_", "").replace("_summary.csv", "")
+        df = load_csv_if_exists(fpath)
+        if df.empty:
+            continue
+        cot_row = df[df["method"] == "chain_of_thought"]
+        if cot_row.empty:
+            continue
+        ablation_brier = float(cot_row["brier_score"].iloc[0])
+        rows.append({
+            "source": source,
+            "ablation_brier": round(ablation_brier, 4),
+            "brier_delta": round(ablation_brier - baseline_brier, 4),
+            "n_games": int(cot_row["n_games"].iloc[0]),
+        })
+
+    if not rows:
+        return
+
+    abl_df = pd.DataFrame(rows).sort_values("brier_delta", ascending=False)
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Ablation Study — Per-Source Impact (RQ3)</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="subtle" style="margin-bottom:12px;">'
+        f'CoT baseline Brier = <strong>{baseline_brier:.4f}</strong>. '
+        f'Each bar shows how much Brier score increases (gets worse) when that data source is removed. '
+        f'Larger positive delta = that source matters more.'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.dataframe(abl_df, use_container_width=True, hide_index=True)
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    fig.patch.set_facecolor("#1e1e1e")
+    ax.set_facecolor("#1e1e1e")
+
+    bar_colors = ["#ff6b6b" if d > 0 else "#39d98a" for d in abl_df["brier_delta"]]
+    bars = ax.bar(abl_df["source"], abl_df["brier_delta"], color=bar_colors, edgecolor="#555")
+
+    ax.axhline(0, color="white", linewidth=1, linestyle="--", alpha=0.5)
+    ax.tick_params(colors="white")
+    ax.title.set_color("white")
+    ax.yaxis.label.set_color("white")
+    ax.xaxis.label.set_color("white")
+    for spine in ax.spines.values():
+        spine.set_color("#555")
+
+    for bar, val in zip(bars, abl_df["brier_delta"]):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.001 if val >= 0 else bar.get_height() - 0.003,
+            f"{val:+.4f}", ha="center", va="bottom" if val >= 0 else "top",
+            color="white", fontsize=9,
+        )
+
+    ax.set_xlabel("Disabled Source")
+    ax.set_ylabel("Brier Delta vs Baseline (↑ = worse)")
+    ax.set_title("Ablation: Which Sources Matter Most?")
+    plt.setp(ax.get_xticklabels(), color="white")
+
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    most_impactful = abl_df.iloc[0]["source"]
+    st.caption(
+        f"Most impactful source removed: **{most_impactful}** "
+        f"(Δ Brier = {abl_df.iloc[0]['brier_delta']:+.4f}). "
+        f"Sources with near-zero delta had no historical data available in backtest context."
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
 def main():
     render_header()
 
@@ -623,6 +820,8 @@ def main():
     render_summary_section(summary_df)
     render_metric_comparison_charts(summary_df)
     render_calibration_section(cal_df)
+    render_info_density_section(pred_df)
+    render_ablation_section()
     render_prediction_table(pred_df)
     render_disagreement_section(pred_df)
 
