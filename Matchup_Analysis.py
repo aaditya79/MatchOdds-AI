@@ -3,6 +3,9 @@ import io
 import json
 import html
 import time
+from dotenv import load_dotenv
+
+load_dotenv()
 import contextlib
 import streamlit as st
 import pandas as pd
