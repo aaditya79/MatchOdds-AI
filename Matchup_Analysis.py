@@ -6,6 +6,16 @@ import time
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Streamlit Cloud stores secrets in st.secrets — pull them into os.environ
+# so the rest of the app (which reads os.environ) finds them.
+try:
+    import streamlit as st
+    for _key in ("ANTHROPIC_API_KEY", "ODDS_API_KEY", "YOUTUBE_API_KEY"):
+        if _key not in os.environ and hasattr(st, "secrets") and _key in st.secrets:
+            os.environ[_key] = st.secrets[_key]
+except Exception:
+    pass
 import contextlib
 import streamlit as st
 import pandas as pd
