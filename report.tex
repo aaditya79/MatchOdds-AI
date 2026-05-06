@@ -1,4 +1,4 @@
-\documentclass[11pt,twocolumn]{article}
+\documentclass[11pt]{article}
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
@@ -12,7 +12,7 @@
 \usepackage{float}
 \usepackage{array}
 \usepackage{multirow}
-% \usepackage{multicol}
+\usepackage{multicol}
 
 \hypersetup{
     colorlinks=true,
@@ -33,10 +33,14 @@
 \begin{document}
 
 \maketitle
+\vspace{-1.5em}
 
-\begin{abstract}
-We present MatchOdds AI, an agentic retrieval-augmented generation system that produces structured pre-game betting reports for NBA games. The system aggregates data from six sources (game statistics, injury reports, bookmaker odds, historical similar matchups via ChromaDB, news sentiment, and social media), then applies one of three reasoning strategies: a single ReAct agent, a chain-of-thought (CoT) baseline, and a three-agent iterative debate. We evaluate all three methods on 132 historical 2024--25 season games using Brier score, log loss, expected calibration error (ECE), and accuracy. CoT achieves the best performance on every metric (Brier 0.228, accuracy 61.4\%, ECE 0.068), outperforming both the single agent (Brier 0.297, accuracy 52.8\%) and the multi-agent debate (Brier 0.283, accuracy 52.3\%). Both the single agent and multi-agent debate fall below the random-predictor Brier baseline of 0.25. Information density shows a weak positive correlation with Brier score, meaning high-profile games with more available data are marginally harder to predict. Manual report quality scoring confirms CoT superiority across all four qualitative criteria. These results suggest that for narrow, factual, analytical tasks, a single structured reasoning pass over pre-gathered evidence outperforms both iterative tool-calling and multi-agent debate. Code and documentation are available at \href{https://github.com/aaditya79/MatchOdds-AI}{\texttt{github.com/aaditya79/MatchOdds-AI}}.
-\end{abstract}
+\section*{Abstract}
+\vspace{-0.7em}
+MatchOdds AI is an agentic retrieval-augmented generation system that produces structured pre-game betting reports for NBA games. The system aggregates data from six sources (game statistics, injury reports, bookmaker odds, historical similar matchups via ChromaDB, news sentiment, and social media), then applies one of three reasoning strategies: a single ReAct agent, a chain-of-thought (CoT) baseline, and a three-agent iterative debate. We evaluate all three methods on 132 historical 2024--25 season games using Brier score, log loss, expected calibration error (ECE), and accuracy. CoT achieves the best performance on every metric (Brier 0.228, accuracy 61.4\%, ECE 0.068), outperforming both the single agent (Brier 0.297, accuracy 52.8\%) and the multi-agent debate (Brier 0.283, accuracy 52.3\%). Both the single agent and multi-agent debate fall below the random-predictor Brier baseline of 0.25. Information density shows a weak positive correlation with Brier score, meaning high-profile games with more available data are marginally harder to predict. Manual report quality scoring confirms CoT superiority across all four qualitative criteria. These results suggest that for narrow, factual, analytical tasks, a single structured reasoning pass over pre-gathered evidence outperforms both iterative tool-calling and multi-agent debate. Code and documentation are available at \href{https://github.com/aaditya79/MatchOdds-AI}{\texttt{github.com/aaditya79/MatchOdds-AI}}.
+
+\vspace{1em}
+\begin{multicols}{2}
 
 % ============================================================
 \section{Introduction}
@@ -204,7 +208,7 @@ We manually score 21 reports on four criteria rated 1--5: factual accuracy, comp
 
 \subsection{Main Comparison (RQ2)}
 
-Table \ref{tab:main} reports aggregate metrics for all three methods over 132 games. Figure \ref{fig:brier} visualizes the Brier score comparison.
+Table \ref{tab:main} reports aggregate metrics for all three methods over 132 games.
 
 \begin{table}[H]
 \centering
@@ -234,11 +238,9 @@ The poor performance of multi-agent debate and single agent is driven primarily 
 
 \subsection{Calibration}
 
-Table \ref{tab:calibration} and Figure \ref{fig:calibration} show 5-bin calibration results. CoT is relatively well-calibrated in the middle probability ranges. Multi-agent debate shows severe overconfidence at high predicted probabilities: when it assigns 80--100\% home-win probability, the actual home-win rate is only 20\%, a gap of 0.64.
-
 \begin{table}[H]
 \centering
-\caption{5-bin calibration summary. Bold row indicates worst miscalibration.}
+\caption{5-bin calibration summary.}
 \label{tab:calibration}
 \resizebox{\columnwidth}{!}{
 \begin{tabular}{llrrrr}
@@ -266,9 +268,9 @@ Single agent & (0.8, 1.0] & 12 & 0.880 & 0.667 & 0.213 \\
 }
 \end{table}
 
-\subsection{Information Density vs. Prediction Quality (RQ1)}
+CoT is relatively well-calibrated in the middle probability ranges. Multi-agent debate shows severe overconfidence at high predicted probabilities.
 
-Table \ref{tab:density} and Figure \ref{fig:density} show the relationship between pre-game information availability and prediction quality.
+\subsection{Information Density vs. Prediction Quality (RQ1)}
 
 \begin{table}[H]
 \centering
@@ -286,9 +288,7 @@ context\_tokens   & +0.058 & +0.114 \\
 \end{tabular}
 \end{table}
 
-More available pre-game information does not improve prediction quality. High-context games have a mean Brier of 0.262 (top quartile) versus 0.239 (bottom quartile). The scatter in Figure \ref{fig:density} shows that CoT (green, clustered at low token counts) achieves consistently low Brier scores, while multi-agent debate (gold) spreads across higher token ranges with more variance.
-
-\textbf{Headline finding for RQ1:} High-profile games with more context are marginally harder to predict, consistent with efficient markets narrowing the exploitable probability gap on nationally covered games.
+More available pre-game information does not improve prediction quality. High-context games are slightly harder, with a mean Brier of 0.262 in the top quartile versus 0.239 in the bottom quartile.
 
 \subsection{Ablation Study (RQ3)}
 
@@ -311,7 +311,7 @@ stats & \textcolor{red}{pending} & \textcolor{red}{pending} \\
 \end{tabular}
 \end{table}
 
-The YouTube result (delta = -0.017) reflects statistical noise from a different game sample combined with the fact that YouTube returns zero signal for historical games.
+The YouTube result reflects statistical noise from a different game sample combined with the fact that YouTube returns zero signal for historical games.
 
 \subsection{Manual Report Quality Scoring}
 
@@ -371,9 +371,9 @@ The weak positive correlation between context tokens and Brier score is consiste
 \section{Streamlit Deployment}
 % ============================================================
 
-The system is deployed as a multi-page Streamlit web app. The main matchup analysis page allows users to select an upcoming game from live bookmaker odds, choose a reasoning method, and generate a full report. Report sections include win probability gauges, a bookmaker market comparison, key factors, similar historical games retrieved from ChromaDB, a reasoning trace, and a downloadable JSON report.
+The system is deployed as a multi-page Streamlit web app. The main matchup analysis page allows users to select an upcoming game from live bookmaker odds, choose a reasoning method, and generate a full report. Report sections include win probability gauges, a bookmaker market comparison, key factors, similar historical games, a reasoning trace, and a downloadable JSON report.
 
-A research evaluation page renders the backtest CSV files with interactive metric comparisons, calibration curves, an information density scatter plot, and an ablation bar chart that updates automatically as ablation runs complete.
+A research evaluation page renders the backtest CSV files with interactive metric comparisons, calibration curves, an information density scatter plot, and an ablation bar chart. All visualizations update automatically when the underlying CSV files change.
 
 % ============================================================
 \section{GitHub Repository}
@@ -385,7 +385,7 @@ All code, documentation, and example outputs are available at:
 \url{https://github.com/aaditya79/MatchOdds-AI}
 \end{center}
 
-The repository includes setup instructions, API key configuration, data pipeline commands, backtest reproduction steps, and team attribution. Python dependencies are pinned in \texttt{requirements.txt} and the environment can be reproduced with \texttt{python3.12 -m venv .venv \&\& pip install -r requirements.txt}.
+The repository includes setup instructions, API key configuration, data pipeline commands, backtest reproduction steps, and team attribution.
 
 % ============================================================
 \section{Conclusion}
@@ -395,7 +395,7 @@ We built and evaluated MatchOdds AI, an agentic RAG system for NBA pre-game bett
 
 For RQ1, information density shows no beneficial effect on prediction quality. High-profile games with more available data are marginally harder to predict, consistent with efficient markets narrowing the exploitable probability gap on nationally covered games.
 
-For RQ3, the ablation study is partially complete. \textcolor{red}{[Update once all seven ablation runs finish.]}
+For RQ3, the ablation study is still pending for six of seven sources. The final interpretation should be updated once all ablation runs complete.
 
 The project delivers all six proposed deliverables: an agentic RAG pipeline, a multi-agent debate system, a CoT baseline, a quantitative evaluation across all three research questions, a deployed Streamlit app, and an open-source repository with documentation and example reports.
 
@@ -445,27 +445,29 @@ Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., and Cao, Y. (202
 
 \end{thebibliography}
 
+\end{multicols}
+
 \clearpage
 
-\begin{figure*}[p]
+\begin{figure}[H]
 \centering
 \includegraphics[width=0.72\textwidth]{fig_brier_bar.png}
 \caption{Brier score comparison across the three reasoning methods. Lower is better. The dashed reference at 0.25 represents a 50/50 random predictor. Chain-of-thought (CoT) is the only method that beats the random baseline. Multi-agent debate and single agent both fall above 0.25, indicating performance below random on probabilistic accuracy.}
 \label{fig:brier}
-\end{figure*}
+\end{figure}
 
-\begin{figure*}[p]
+\begin{figure}[H]
 \centering
 \includegraphics[width=0.82\textwidth]{fig_calibration.png}
-\caption{Calibration curves for all three methods. The dashed red diagonal represents perfect calibration. CoT (blue) tracks closely to the diagonal in the 0.4--0.8 range. Multi-agent debate (orange) diverges sharply at high confidence: when it predicts 80--100\% home-win probability, the actual home-win rate drops to 20\%, indicating dangerous overconfidence when agents converge. Single agent (green) is systematically miscalibrated across all bins.}
+\caption{Calibration curves for all three methods. The dashed diagonal represents perfect calibration. CoT (blue) tracks closely to the diagonal in the 0.4--0.8 range. Multi-agent debate (orange) diverges sharply at high confidence: when it predicts 80--100\% home-win probability, the actual home-win rate drops to 20\%, indicating dangerous overconfidence when agents converge. Single agent (green) is systematically miscalibrated across all bins.}
 \label{fig:calibration}
-\end{figure*}
+\end{figure}
 
-\begin{figure*}[p]
+\begin{figure}[H]
 \centering
 \includegraphics[width=0.82\textwidth]{fig_density.png}
 \caption{Information density (context tokens) versus Brier score for all 389 game-method predictions. CoT predictions (green, left cluster) use far fewer tokens since evidence is gathered via Python calls with no intermediate LLM context. Multi-agent debate (gold, right cluster) uses 3--5$\times$ more tokens due to three agents debating across two rounds. The Pearson $r = +0.058$ indicates a weak positive relationship: games with more available context are marginally harder to predict, consistent with more-covered games having tighter and harder-to-exploit betting lines.}
 \label{fig:density}
-\end{figure*}
+\end{figure}
 
 \end{document}
