@@ -12,7 +12,7 @@
 \usepackage{float}
 \usepackage{array}
 \usepackage{multirow}
-\usepackage{multicol}
+% \usepackage{multicol}
 
 \hypersetup{
     colorlinks=true,
@@ -40,7 +40,6 @@
 We present MatchOdds AI, an agentic retrieval-augmented generation system that produces structured pre-game betting reports for NBA games. The system aggregates data from six sources (game statistics, injury reports, bookmaker odds, historical similar matchups via ChromaDB, news sentiment, and social media), then applies one of three reasoning strategies: a single ReAct agent, a chain-of-thought (CoT) baseline, and a three-agent iterative debate. We evaluate all three methods on 132 historical 2024--25 season games using Brier score, log loss, expected calibration error (ECE), and accuracy. CoT achieves the best performance on every metric (Brier 0.228, accuracy 61.4\%, ECE 0.068), outperforming both the single agent (Brier 0.297, accuracy 52.8\%) and the multi-agent debate (Brier 0.283, accuracy 52.3\%). Both the single agent and multi-agent debate fall below the random-predictor Brier baseline of 0.25. Information density shows a weak positive correlation with Brier score, meaning high-profile games with more available data are marginally harder to predict. Manual report quality scoring confirms CoT superiority across all four qualitative criteria. These results suggest that for narrow, factual, analytical tasks, a single structured reasoning pass over pre-gathered evidence outperforms both iterative tool-calling and multi-agent debate. Code and documentation are available at \href{https://github.com/aaditya79/MatchOdds-AI}{\texttt{github.com/aaditya79/MatchOdds-AI}}.
 
 \vspace{1em}
-\begin{multicols}{2}
 
 % ============================================================
 \section{Introduction}
@@ -448,12 +447,6 @@ Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., and Cao, Y. (202
 \newblock In \textit{Proceedings of ICLR 2023}.
 
 \end{thebibliography}
-
-\end{multicols}
-
-% ============================================================
-% FIGURES — placed after multicols to span full width
-% ============================================================
 
 \clearpage
 
