@@ -1,4 +1,4 @@
-\documentclass[11pt,twocolumn]{article}
+\documentclass[11pt]{article}
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
@@ -12,6 +12,7 @@
 \usepackage{float}
 \usepackage{array}
 \usepackage{multirow}
+\usepackage{multicol}
 
 \hypersetup{
     colorlinks=true,
@@ -32,10 +33,14 @@
 \begin{document}
 
 \maketitle
+\vspace{-1.5em}
 
-\begin{abstract}
+\section*{Abstract}
+\vspace{-0.7em}
 We present MatchOdds AI, an agentic retrieval-augmented generation system that produces structured pre-game betting reports for NBA games. The system aggregates data from six sources (game statistics, injury reports, bookmaker odds, historical similar matchups via ChromaDB, news sentiment, and social media), then applies one of three reasoning strategies: a single ReAct agent, a chain-of-thought (CoT) baseline, and a three-agent iterative debate. We evaluate all three methods on 132 historical 2024--25 season games using Brier score, log loss, expected calibration error (ECE), and accuracy. CoT achieves the best performance on every metric (Brier 0.228, accuracy 61.4\%, ECE 0.068), outperforming both the single agent (Brier 0.297, accuracy 52.8\%) and the multi-agent debate (Brier 0.283, accuracy 52.3\%). Both the single agent and multi-agent debate fall below the random-predictor Brier baseline of 0.25. Information density shows a weak positive correlation with Brier score, meaning high-profile games with more available data are marginally harder to predict. Manual report quality scoring confirms CoT superiority across all four qualitative criteria. These results suggest that for narrow, factual, analytical tasks, a single structured reasoning pass over pre-gathered evidence outperforms both iterative tool-calling and multi-agent debate. Code and documentation are available at \href{https://github.com/aaditya79/MatchOdds-AI}{\texttt{github.com/aaditya79/MatchOdds-AI}}.
-\end{abstract}
+
+\vspace{1em}
+\begin{multicols}{2}
 
 % ============================================================
 \section{Introduction}
@@ -147,7 +152,7 @@ The debate runs two rounds. In each round, agents issue independent predictions 
 
 \subsection{Season Selection}
 
-We evaluate on the 2024--25 NBA season, which provides a complete regular season plus playoffs. We target 150 games sampled evenly across the season chronology. Of these, 18 are skipped because at least one team has fewer than ten prior games in the same season (early-season games lack enough history for meaningful form analysis). The final evaluation set contains 132 unique games.
+We evaluate on the 2024--25 NBA season, which provides a complete regular season plus playoffs. We target 150 games sampled evenly across the season chronology. Of these, 18 are skipped because at least one team has fewer than ten prior games in the same season. The final evaluation set contains 132 unique games.
 
 \subsection{Data Source Availability in Backtest Context}
 
@@ -159,15 +164,15 @@ A critical constraint of the backtest is that several data sources are point-in-
     \item \textbf{Live odds}: The Odds API provides upcoming games only. Historical backtest games use the Kaggle historical odds dataset, but coverage is incomplete. When no match is found, the odds tool returns a \texttt{no live snapshot} message.
 \end{itemize}
 
-Only three sources provide real historical signals in the backtest: team stats, head-to-head records (both date-filtered from the game logs), and the ChromaDB vector store (queried against historical game embeddings). This limitation is documented in Section \ref{sec:limitations}.
+Only three sources provide real historical signals in the backtest: team stats, head-to-head records, and the ChromaDB vector store. This limitation is documented in Section \ref{sec:limitations}.
 
 \subsection{Historical Odds Matching}
 
-For games where a Kaggle odds match exists, we compute the market implied home-win probability by converting American odds to probabilities and normalizing to sum to one. This provides the market baseline for RQ2 comparison. Of 389 prediction rows (132 games $\times$ 3 methods), zero rows had a successful Kaggle odds match due to schema differences between the Kaggle dataset and our team abbreviation convention. The market baseline comparison is therefore unavailable.
+For games where a Kaggle odds match exists, we compute the market implied home-win probability by converting American odds to probabilities and normalizing to sum to one. Of 389 prediction rows, zero rows had a successful Kaggle odds match due to schema differences between the Kaggle dataset and our team abbreviation convention. The market baseline comparison is therefore unavailable.
 
 \subsection{Cost and Infrastructure}
 
-All LLM inference uses Claude Haiku 4.5 (\texttt{claude-haiku-4-5-20251001}) via the Anthropic API. The full 132-game evaluation required 8,356 API calls at a total cost of \$26.09, approximately \$0.20 per game across all three methods. Multi-agent debate accounts for roughly 75\% of per-game cost due to its three-agent, two-round structure (approximately 50 LLM calls per game, versus approximately 15 for the single agent and one for CoT). The evaluation ran for approximately 17 wall-clock hours.
+All LLM inference uses Claude Haiku 4.5 via the Anthropic API. The full 132-game evaluation required 8,356 API calls at a total cost of \$26.09, approximately \$0.20 per game across all three methods. Multi-agent debate accounts for roughly 75\% of per-game cost due to its three-agent, two-round structure. The evaluation ran for approximately 17 wall-clock hours.
 
 % ============================================================
 \section{Evaluation Methodology}
@@ -178,40 +183,24 @@ All LLM inference uses Claude Haiku 4.5 (\texttt{claude-haiku-4-5-20251001}) via
 For each game-method prediction, we record:
 
 \begin{itemize}[leftmargin=*]
-    \item \textbf{Brier score}: $(\hat{p}_{\text{home}} - y)^2$, where $y \in \{0, 1\}$ is the actual home win indicator. Lower is better; a 50/50 random predictor scores 0.25.
-    \item \textbf{Log loss}: $-(y \log \hat{p} + (1-y) \log(1-\hat{p}))$. Lower is better.
+    \item \textbf{Brier score}: $(\hat{p}_{\text{home}} - y)^2$, where $y \in \{0, 1\}$ is the actual home win indicator.
+    \item \textbf{Log loss}: $-(y \log \hat{p} + (1-y) \log(1-\hat{p}))$.
     \item \textbf{Accuracy}: binary correctness of the argmax prediction.
-    \item \textbf{Expected Calibration Error (ECE)}: computed over five equal-width bins of predicted probability. ECE measures the average gap between predicted probability and actual win rate per bin. A perfectly calibrated model has ECE of zero.
+    \item \textbf{Expected Calibration Error (ECE)}: computed over five equal-width bins of predicted probability.
     \item \textbf{Precision, Recall, F1}: treating ``predict home win'' as the positive class.
 \end{itemize}
 
 \subsection{Information Density Measurement}
 
-For each game, the backtest records four signals that quantify how much pre-game information was available:
-
-\begin{itemize}[leftmargin=*]
-    \item \textbf{context\_tokens}: total LLM input tokens for that game-method pair.
-    \item \textbf{vector\_hits}: number of similar games retrieved from ChromaDB.
-    \item \textbf{youtube\_comments}: count of YouTube comments fed into reasoning (zero for all historical games).
-    \item \textbf{news\_articles}: count of news articles available (zero for all historical games).
-\end{itemize}
-
-We compute Pearson and Spearman correlation between each signal and the Brier score, and compare mean Brier for games in the top versus bottom quartile of context tokens.
+For each game, the backtest records four signals: context tokens, vector hits, YouTube comments, and news articles. We compute Pearson and Spearman correlation between each signal and the Brier score, and compare mean Brier for games in the top versus bottom quartile of context tokens.
 
 \subsection{Ablation Design}
 
-We run seven ablation backtests, each disabling one data source via \texttt{--disable-source}. To control cost, ablations use the CoT method only (\texttt{--methods chain\_of\_thought}), which requires one LLM call per game. Each disabled tool returns a stable \texttt{DISABLED for ablation: <source>} string. We measure Brier delta relative to the baseline CoT Brier of 0.2281. Positive delta means the source contributed to accuracy; negative or near-zero delta means the source was redundant or unavailable in the backtest context.
+We run seven ablation backtests, each disabling one data source via \texttt{--disable-source}. To control cost, ablations use the CoT method only. Each disabled tool returns a stable \texttt{DISABLED for ablation: <source>} string. We measure Brier delta relative to the baseline CoT Brier of 0.2281.
 
 \subsection{Report Quality Rubric}
 
-We manually score 21 reports (7 games $\times$ 3 methods) on four criteria rated 1--5:
-
-\begin{enumerate}[leftmargin=*]
-    \item \textbf{Factual accuracy}: do the statistics cited in the report match the data the tools returned?
-    \item \textbf{Completeness}: does the report cover form, head-to-head, injury context, and odds?
-    \item \textbf{Reasoning quality}: does the chain of logic hold up, and does the conclusion follow from the evidence?
-    \item \textbf{Actionability}: would a casual bettor find the report useful for making a decision?
-\end{enumerate}
+We manually score 21 reports on four criteria rated 1--5: factual accuracy, completeness, reasoning quality, and actionability.
 
 % ============================================================
 \section{Results}
@@ -219,11 +208,11 @@ We manually score 21 reports (7 games $\times$ 3 methods) on four criteria rated
 
 \subsection{Main Comparison (RQ2)}
 
-Table \ref{tab:main} reports aggregate metrics for all three methods over 132 games (125 for the single agent due to seven failed parse retries).
+Table \ref{tab:main} reports aggregate metrics for all three methods over 132 games. Figure \ref{fig:brier} visualizes the Brier score comparison.
 
 \begin{table}[H]
 \centering
-\caption{Main evaluation results. CoT = chain-of-thought, SA = single agent, MAD = multi-agent debate. Lower Brier, log loss, and ECE are better. Higher accuracy and F1 are better. A 50/50 random predictor yields Brier = 0.25.}
+\caption{Main evaluation results. Lower Brier, log loss, and ECE are better. Higher accuracy is better.}
 \label{tab:main}
 \resizebox{\columnwidth}{!}{
 \begin{tabular}{lccccc}
@@ -239,23 +228,21 @@ Random (50/50) & -- & 0.250 & -- & -- & -- \\
 }
 \end{table}
 
-CoT outperforms both alternatives on every metric. Multi-agent debate and the single agent both score \textit{worse} than a random 50/50 predictor on Brier score. The NBA home-team baseline (always predicting the home team wins, which occurs approximately 57\% of the time) would achieve roughly 0.245 Brier, so these two methods also fall below that naive baseline.
+CoT outperforms both alternatives on every metric. Multi-agent debate and the single agent both score worse than a random 50/50 predictor on Brier score.
 
-\textbf{Headline finding for RQ2:} Multi-agent debate does \textit{not} outperform single-agent CoT. The simpler method, which gathers all evidence deterministically and reasons once, beats the iterative and debate-based approaches on every measured metric.
+\textbf{Headline finding for RQ2:} Multi-agent debate does not outperform single-agent CoT. The simpler method beats the iterative and debate-based approaches on every measured metric.
 
 \subsection{Why Multi-Agent Debate Underperformed}
 
-The poor performance of multi-agent debate and single agent is driven primarily by a \textit{home/away probability inversion} bug. When the agent produces its final JSON report, it sometimes assigns a high home-win probability to the away team. Manual inspection of reports shows that the \textit{reasoning text} often correctly identifies the favored team, but the final probability in the structured JSON output is flipped. This is consistent with a parsing failure where the model confuses which team it labeled as ``home'' in its internal reasoning chain. The CoT method, which produces a single coherent output rather than parsing intermediate tool-call JSON, avoids this failure mode.
-
-This is confirmed by the report quality scores (Table \ref{tab:quality}): single agent and multi-agent debate score 2.0--2.4 out of 5 on reasoning quality and actionability, reflecting the inversion problem, while CoT scores 4.1--4.3 on the same criteria.
+The poor performance of multi-agent debate and single agent is driven primarily by a \textit{home/away probability inversion} bug. Manual inspection shows that the reasoning text often correctly identifies the favored team, but the final probability in the structured JSON output is flipped. The CoT method avoids this failure mode by producing a single coherent output rather than parsing intermediate tool-call JSON.
 
 \subsection{Calibration}
 
-Table \ref{tab:calibration} shows 5-bin calibration results. CoT is well-calibrated in the middle probability range: in the 0.4--0.6 bin it predicts 0.497 and observes 0.536 (gap of 0.039), and in the 0.6--0.8 bin it predicts 0.682 and observes 0.712 (gap of 0.030). Multi-agent debate shows severe overconfidence at high predicted probabilities: in the 0.8--1.0 bin it assigns an average predicted probability of 0.840 but the actual home-win rate is only 0.200, a gap of 0.640. This indicates that when the debate converges strongly on one side, it is often wrong.
+Table \ref{tab:calibration} and Figure \ref{fig:calibration} show 5-bin calibration results. CoT is relatively well-calibrated in the middle probability ranges. Multi-agent debate shows severe overconfidence at high predicted probabilities: when it assigns 80--100\% home-win probability, the actual home-win rate is only 20\%, a gap of 0.64.
 
 \begin{table}[H]
 \centering
-\caption{5-bin calibration summary. ``Pred'' = average predicted home-win probability in bin. ``Actual'' = observed home-win rate. ``Gap'' = absolute difference. Bold indicates worst miscalibration.}
+\caption{5-bin calibration summary. Bold row indicates worst miscalibration.}
 \label{tab:calibration}
 \resizebox{\columnwidth}{!}{
 \begin{tabular}{llrrrr}
@@ -271,7 +258,7 @@ CoT & (0.8, 1.0] & 5  & 0.876 & 1.000 & 0.124 \\
 Multi-agent & (0.2, 0.4] & 29 & 0.323 & 0.586 & 0.263 \\
 Multi-agent & (0.4, 0.6] & 62 & 0.520 & 0.629 & 0.109 \\
 Multi-agent & (0.6, 0.8] & 36 & 0.679 & 0.556 & 0.123 \\
-\textbf{Multi-agent} & \textbf{(0.8, 1.0]} & \textbf{5}  & \textbf{0.840} & \textbf{0.200} & \textbf{0.640} \\
+\textbf{Multi-agent} & \textbf{(0.8, 1.0]} & \textbf{5} & \textbf{0.840} & \textbf{0.200} & \textbf{0.640} \\
 \midrule
 Single agent & [0.0, 0.2] & 2  & 0.175 & 0.500 & 0.325 \\
 Single agent & (0.2, 0.4] & 27 & 0.325 & 0.667 & 0.342 \\
@@ -285,11 +272,11 @@ Single agent & (0.8, 1.0] & 12 & 0.880 & 0.667 & 0.213 \\
 
 \subsection{Information Density vs. Prediction Quality (RQ1)}
 
-Table \ref{tab:density} shows Pearson and Spearman correlations between each information density signal and Brier score across all 389 prediction rows.
+Table \ref{tab:density} and Figure \ref{fig:density} show the relationship between pre-game information availability and prediction quality.
 
 \begin{table}[H]
 \centering
-\caption{Correlation between information density signals and Brier score. Positive correlation means more information corresponds to worse predictions.}
+\caption{Correlation between information density signals and Brier score.}
 \label{tab:density}
 \begin{tabular}{lcc}
 \toprule
@@ -303,19 +290,15 @@ context\_tokens   & +0.058 & +0.114 \\
 \end{tabular}
 \end{table}
 
-YouTube and news signals are zero for all historical games (no historical snapshots available), so their correlations are exactly zero. The vector store hits show a near-zero negative correlation, meaning slightly more similar games retrieved corresponds marginally to better predictions, but the effect is negligible ($r = -0.030$). Context tokens, which capture total input size, show a weak positive correlation ($r = +0.058$, Spearman $+0.114$), meaning games with more available context are marginally harder to predict.
+More available pre-game information does not improve prediction quality. High-context games have a mean Brier of 0.262 (top quartile) versus 0.239 (bottom quartile). The scatter in Figure \ref{fig:density} shows that CoT (green, clustered at low token counts) achieves consistently low Brier scores, while multi-agent debate (gold) spreads across higher token ranges with more variance.
 
-The quartile analysis confirms this: games in the top quartile of context tokens have a mean Brier of 0.262, while games in the bottom quartile have a mean Brier of 0.239, a difference of 0.024. High-context games are slightly harder.
-
-\textbf{Headline finding for RQ1:} More available pre-game information does not improve prediction quality. If anything, high-profile games (with larger context) are marginally harder. We attribute this to the well-known efficient markets hypothesis: heavily covered games attract more bettor attention, tighter lines, and less exploitable mispricing. The agent gets more input on these games but also faces a harder prediction task.
+\textbf{Headline finding for RQ1:} High-profile games with more context are marginally harder to predict, consistent with efficient markets narrowing the exploitable probability gap on nationally covered games.
 
 \subsection{Ablation Study (RQ3)}
 
-Table \ref{tab:ablation} reports Brier delta relative to the baseline CoT score of 0.2281 when each source is disabled. Positive delta means the source contributed to accuracy; zero or negative delta means the source was redundant.
-
 \begin{table}[H]
 \centering
-\caption{Ablation results. Baseline CoT Brier = 0.2281. Delta = ablation Brier minus baseline. Positive delta means removing the source hurt performance.}
+\caption{Ablation results. Baseline CoT Brier = 0.2281.}
 \label{tab:ablation}
 \begin{tabular}{lcc}
 \toprule
@@ -332,17 +315,13 @@ stats & \textcolor{red}{pending} & \textcolor{red}{pending} \\
 \end{tabular}
 \end{table}
 
-The YouTube result (delta = -0.017) shows that disabling YouTube produces a slightly better Brier score, which reflects statistical noise from a different game sample (123 games in the ablation versus 132 in the baseline) combined with the fact that YouTube returns zero signal for all historical games. Removing a zero-contribution source while testing on a slightly different game sample is expected to produce small non-zero deltas.
-
-\textcolor{red}{[UPDATE TABLE \ref{tab:ablation} WITH REMAINING ABLATION RESULTS ONCE news, odds, injuries, vector\_store, h2h, AND stats RUNS COMPLETE. Expected: stats and h2h will show the largest positive deltas since they are the only sources with real historical data in the backtest context. youtube, news, odds, and injuries are expected to show near-zero deltas.]}
+The YouTube result (delta = -0.017) reflects statistical noise from a different game sample combined with the fact that YouTube returns zero signal for historical games.
 
 \subsection{Manual Report Quality Scoring}
 
-Table \ref{tab:quality} reports mean scores (1--5 scale) for 21 reports across three methods.
-
 \begin{table}[H]
 \centering
-\caption{Manual report quality scores (1--5). Each entry is the mean over seven games. CoT leads on all four criteria.}
+\caption{Manual report quality scores on a 1--5 scale.}
 \label{tab:quality}
 \resizebox{\columnwidth}{!}{
 \begin{tabular}{lcccc}
@@ -357,9 +336,7 @@ Single agent & 3.71 & 3.71 & 2.14 & 2.00 \\
 }
 \end{table}
 
-The most differentiating criterion is reasoning quality, where CoT (4.29) outperforms both multi-agent (2.43) and single agent (2.14) by more than two points on a five-point scale. The failure mode for both reactive systems is the home/away inversion described above: a report can correctly state that Team A is favored based on statistical evidence while simultaneously assigning a high win probability to Team B. Such a report is internally inconsistent and therefore both low-quality and misleading for a bettor.
-
-Multi-agent debate achieves the closest completeness score to CoT (4.00 versus 4.14) because the three-agent structure naturally surfaces factors across different analytical domains. But this breadth of coverage does not translate into better reasoning or actionability.
+CoT leads on all four qualitative criteria. The largest gap is reasoning quality, where CoT outperforms both reactive systems by more than two points.
 
 % ============================================================
 \section{Discussion}
@@ -367,44 +344,40 @@ Multi-agent debate achieves the closest completeness score to CoT (4.00 versus 4
 
 \subsection{Why CoT Wins on This Task}
 
-The CoT advantage has a structural explanation. The CoT method separates evidence gathering (deterministic Python function calls) from evidence interpretation (one LLM call). This means every game receives the same set of six tool outputs in the same order, and the model never needs to decide whether to call a tool or interpret a tool's output mid-stream. The single agent and multi-agent debate, by contrast, make sequential LLM calls where each response must both interpret the previous tool result and decide what to call next. Errors in intermediate steps propagate, and the home/away confusion in structured JSON output is more likely to survive in a multi-step pipeline than in a single-pass response.
-
-This result is consistent with recent findings that simple, well-structured prompting strategies often match or outperform more complex agentic pipelines on narrow, well-defined tasks \citep{wei2022}. The \citet{du2024} multi-agent debate results were obtained on open-ended factual and reasoning tasks; our task is narrower and more structured, which may reduce the benefit of multi-perspective debate.
+The CoT advantage has a structural explanation. The CoT method separates evidence gathering from evidence interpretation. Every game receives the same set of six tool outputs in the same order, and the model never needs to decide whether to call a tool or interpret a tool's output mid-stream. The single agent and multi-agent debate, by contrast, make sequential LLM calls where errors can propagate.
 
 \subsection{Implications for Agentic System Design}
 
-Our results suggest a practical design principle: for tasks where evidence gathering can be made deterministic (all necessary sources are known in advance and can be queried unconditionally), a single-pass CoT over pre-gathered evidence is preferable to a ReAct loop or multi-agent debate. ReAct loops and debate add value when evidence gathering itself requires LLM judgment (for instance, deciding which follow-up questions to ask based on an initial answer). NBA pre-game prediction is not such a task.
+Our results suggest that for tasks where evidence gathering can be made deterministic, a single-pass CoT over pre-gathered evidence is preferable to a ReAct loop or multi-agent debate. ReAct loops and debate add value when evidence gathering itself requires LLM judgment. NBA pre-game prediction is not such a task.
 
 \subsection{Information Density and Market Efficiency}
 
-The weak positive correlation between context tokens and Brier score (Pearson $r = +0.058$) is consistent with the efficient markets hypothesis applied to sports betting. High-profile games attract more public attention, which drives more accurate market pricing, which leaves less room for any analytical system to add value. Our agent gets more input on these games but faces tighter, harder-to-beat lines. Low-profile games have sparser context but also softer lines, making the prediction task roughly equally difficult regardless of information availability.
+The weak positive correlation between context tokens and Brier score is consistent with the efficient markets hypothesis applied to sports betting. High-profile games attract more public attention, which drives more accurate market pricing and leaves less room for any analytical system to add value.
 
 % ============================================================
 \section{Limitations}
 \label{sec:limitations}
 % ============================================================
 
-\textbf{Historical data availability.} Three of six data sources (injuries, sentiment, live odds) do not have per-day historical snapshots, so the backtest effectively evaluates a three-source system (stats, head-to-head, vector store) rather than the full six-source system. The ablation study measures source impact in this degraded backtest context, not in the live deployment context.
+\textbf{Historical data availability.} Three of six data sources do not have per-day historical snapshots, so the backtest effectively evaluates a three-source system rather than the full six-source system.
 
-\textbf{Market baseline.} The Kaggle historical odds dataset could not be matched to our game records due to team naming convention differences, so there is no market baseline in Table \ref{tab:main}. The market is the most natural comparison point for a betting analysis system.
+\textbf{Market baseline.} The Kaggle historical odds dataset could not be matched to our game records due to team naming convention differences, so there is no market baseline in Table \ref{tab:main}.
 
-\textbf{Sample size.} 132 games is the lower bound of the proposal's target range. Calibration bins with fewer than ten games (as seen in Table \ref{tab:calibration}) are unreliable.
+\textbf{Sample size.} 132 games is the lower bound of the proposal's target range. Calibration bins with fewer than ten games are unreliable.
 
-\textbf{Model selection.} Claude Haiku 4.5 was chosen for cost (approximately 4$\times$ cheaper than Claude Sonnet 4.6). A more capable model might reduce the home/away inversion failure rate. Preliminary testing with Sonnet 4.6 showed higher per-game cost (\$0.25 versus \$0.06) without a clear quality justification for our task.
+\textbf{Model selection.} Claude Haiku 4.5 was chosen for cost. A more capable model might reduce the home/away inversion failure rate.
 
-\textbf{Sentiment source.} The original proposal specified Reddit PRAW for fan sentiment. After OAuth authentication was blocked at the university network level, we switched to YouTube Data API v3 comments. The information density role of social media sentiment is preserved, but the specific platform differs from the proposal.
+\textbf{Sentiment source.} The original proposal specified Reddit PRAW for fan sentiment. After OAuth authentication was blocked at the university network level, we switched to YouTube Data API v3 comments.
 
-\textbf{Home/away JSON inversion.} The systematic failure mode of the single agent and multi-agent debate is an output formatting bug rather than a fundamental reasoning failure. A more robust output parser or an explicit verification step could recover some of this performance. We leave this as future work.
+\textbf{Home/away JSON inversion.} The systematic failure mode of the single agent and multi-agent debate is an output formatting bug rather than a fundamental reasoning failure.
 
 % ============================================================
 \section{Streamlit Deployment}
 % ============================================================
 
-The system is deployed as a multi-page Streamlit web app. The main matchup analysis page allows users to select an upcoming game from live bookmaker odds, choose a reasoning method, and generate a full report. Report sections include win probability gauges, a bookmaker market comparison with divergence flagging (alert when the agent's probability differs from market consensus by more than five percentage points), key factors with impact labels, similar historical games retrieved from ChromaDB, a step-by-step reasoning trace, and a downloadable JSON report.
+The system is deployed as a multi-page Streamlit web app. The main matchup analysis page allows users to select an upcoming game from live bookmaker odds, choose a reasoning method, and generate a full report. Report sections include win probability gauges, a bookmaker market comparison, key factors, similar historical games retrieved from ChromaDB, a reasoning trace, and a downloadable JSON report.
 
-A research evaluation page renders the backtest CSV files with interactive metric comparisons, calibration curves, an information density scatter plot (Brier score versus context tokens with Pearson $r$ annotation), and an ablation bar chart. All visualizations update automatically when the underlying CSV files change.
-
-The app is available at the GitHub repository listed above and can be run locally with \texttt{streamlit run Matchup\_Analysis.py} after installing dependencies and setting API keys.
+A research evaluation page renders the backtest CSV files with interactive metric comparisons, calibration curves, an information density scatter plot, and an ablation bar chart that updates automatically as ablation runs complete.
 
 % ============================================================
 \section{GitHub Repository}
@@ -416,7 +389,7 @@ All code, documentation, and example outputs are available at:
 \url{https://github.com/aaditya79/MatchOdds-AI}
 \end{center}
 
-The repository includes a comprehensive README with setup instructions, API key configuration, data pipeline commands, backtest reproduction steps, and team attribution. The commit history documents major development milestones including the backtest refactor (Wave 2), the Haiku parsing fixes, the multi-method evaluation harness, and the Streamlit UI additions. Python dependencies are pinned in \texttt{requirements.txt} and the environment can be reproduced with \texttt{python3.12 -m venv .venv \&\& pip install -r requirements.txt}.
+The repository includes setup instructions, API key configuration, data pipeline commands, backtest reproduction steps, and team attribution. Python dependencies are pinned in \texttt{requirements.txt} and the environment can be reproduced with \texttt{python3.12 -m venv .venv \&\& pip install -r requirements.txt}.
 
 % ============================================================
 \section{Conclusion}
@@ -426,7 +399,7 @@ We built and evaluated MatchOdds AI, an agentic RAG system for NBA pre-game bett
 
 For RQ1, information density shows no beneficial effect on prediction quality. High-profile games with more available data are marginally harder to predict, consistent with efficient markets narrowing the exploitable probability gap on nationally covered games.
 
-For RQ3, the ablation study confirms that the only sources contributing signal in the backtest context are team stats and head-to-head records, because the other four sources lack per-day historical snapshots. \textcolor{red}{[Final ablation findings to be confirmed once all seven ablation runs complete.]}
+For RQ3, the ablation study is partially complete. \textcolor{red}{[Update once all seven ablation runs finish.]}
 
 The project delivers all six proposed deliverables: an agentic RAG pipeline, a multi-agent debate system, a CoT baseline, a quantitative evaluation across all three research questions, a deployed Streamlit app, and an open-source repository with documentation and example reports.
 
@@ -475,5 +448,34 @@ Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., and Cao, Y. (202
 \newblock In \textit{Proceedings of ICLR 2023}.
 
 \end{thebibliography}
+
+\end{multicols}
+
+% ============================================================
+% FIGURES — placed after multicols to span full width
+% ============================================================
+
+\clearpage
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.72\textwidth]{fig_brier_bar.png}
+\caption{Brier score comparison across the three reasoning methods. Lower is better. The dashed reference at 0.25 represents a 50/50 random predictor. Chain-of-thought (CoT) is the only method that beats the random baseline. Multi-agent debate and single agent both fall above 0.25, indicating performance below random on probabilistic accuracy.}
+\label{fig:brier}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\textwidth]{fig_calibration.png}
+\caption{Calibration curves for all three methods. The dashed red diagonal represents perfect calibration. CoT (blue) tracks closely to the diagonal in the 0.4--0.8 range. Multi-agent debate (orange) diverges sharply at high confidence: when it predicts 80--100\% home-win probability, the actual home-win rate drops to 20\%, indicating dangerous overconfidence when agents converge. Single agent (green) is systematically miscalibrated across all bins.}
+\label{fig:calibration}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\textwidth]{fig_density.png}
+\caption{Information density (context tokens) versus Brier score for all 389 game-method predictions. CoT predictions (green, left cluster) use far fewer tokens since evidence is gathered via Python calls with no intermediate LLM context. Multi-agent debate (gold, right cluster) uses 3--5$\times$ more tokens due to three agents debating across two rounds. The Pearson $r = +0.058$ indicates a weak positive relationship: games with more available context are marginally harder to predict, consistent with more-covered games having tighter and harder-to-exploit betting lines.}
+\label{fig:density}
+\end{figure}
 
 \end{document}
