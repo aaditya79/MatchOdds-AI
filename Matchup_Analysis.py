@@ -1499,17 +1499,12 @@ def render_analysis_trace(trace_text, mode):
     if not trace_text or not trace_text.strip():
         return
 
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Analysis Trace</div>', unsafe_allow_html=True)
-    st.markdown(
-        """
-        <div class="subtle" style="margin-bottom:12px;">
-            This shows the model's visible step-by-step workflow: data gathering, tool calls, debate rounds, and final synthesis.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    with st.expander("View Analysis Trace", expanded=False):
+        st.caption("Step-by-step workflow: data gathering, tool calls, debate rounds, and final synthesis.")
+        st.code(trace_text.strip(), language=None)
+        return
 
+    # Legacy rendering below (unreachable, kept for reference)
     lines = [clean_trace_line(line) for line in trace_text.splitlines()]
     lines = [line for line in lines if line]
 

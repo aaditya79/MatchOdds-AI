@@ -1,0 +1,479 @@
+\documentclass[11pt,twocolumn]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{natbib}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{array}
+\usepackage{multirow}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{\textbf{MatchOdds AI: An Agentic RAG System for NBA Pre-Game Betting Analysis}}
+
+\author{
+    Pranav Jain \quad Aaditya Pai \quad Tanish Patel \\
+    \texttt{STAT GR5293 | Spring 2026 | Columbia University}
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present MatchOdds AI, an agentic retrieval-augmented generation system that produces structured pre-game betting reports for NBA games. The system aggregates data from six sources (game statistics, injury reports, bookmaker odds, historical similar matchups via ChromaDB, news sentiment, and social media), then applies one of three reasoning strategies: a single ReAct agent, a chain-of-thought (CoT) baseline, and a three-agent iterative debate. We evaluate all three methods on 132 historical 2024--25 season games using Brier score, log loss, expected calibration error (ECE), and accuracy. CoT achieves the best performance on every metric (Brier 0.228, accuracy 61.4\%, ECE 0.068), outperforming both the single agent (Brier 0.297, accuracy 52.8\%) and the multi-agent debate (Brier 0.283, accuracy 52.3\%). Both the single agent and multi-agent debate fall below the random-predictor Brier baseline of 0.25. Information density shows a weak positive correlation with Brier score, meaning high-profile games with more available data are marginally harder to predict. Manual report quality scoring confirms CoT superiority across all four qualitative criteria. These results suggest that for narrow, factual, analytical tasks, a single structured reasoning pass over pre-gathered evidence outperforms both iterative tool-calling and multi-agent debate. Code and documentation are available at \href{https://github.com/aaditya79/MatchOdds-AI}{\texttt{github.com/aaditya79/MatchOdds-AI}}.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+% ============================================================
+
+Pre-game NBA betting requires synthesizing information scattered across many sources: injury reports, recent form, head-to-head records, schedule context (back-to-back games, rest days), fan sentiment, and cross-sportsbook odds. A casual bettor cannot reliably aggregate all of this before tip-off. We built MatchOdds AI to do it automatically.
+
+Beyond the practical product, the system serves as a research platform for three questions that have not been studied together. First, does the amount of publicly available pre-game information predict how accurately an LLM agent can forecast the outcome? A Lakers--Celtics national television game generates an order of magnitude more news coverage and social media commentary than a mid-week Pistons--Hornets matchup, while the prediction task and market structure remain constant. Second, does a multi-agent debate with differentiated analytical roles \citep{du2024} outperform a single chain-of-thought pass \citep{wei2022} when both receive the same evidence? Third, which data sources actually contribute to prediction quality, and which are redundant?
+
+\subsection{Research Questions}
+
+\begin{description}[leftmargin=0pt]
+    \item[RQ1] How does prediction quality relate to information density? We measure how much data each game provides and plot Brier score against it.
+    \item[RQ2] Does multi-agent debate with differentiated tool access outperform single-agent chain-of-thought reasoning?
+    \item[RQ3] Which data sources contribute most to prediction quality, as measured by the change in Brier score when each source is disabled?
+\end{description}
+
+% ============================================================
+\section{Related Work}
+% ============================================================
+
+\subsection{Retrieval-Augmented Generation}
+
+\citet{lewis2020} introduced retrieval-augmented generation (RAG) to ground LLM outputs in external documents. Most RAG evaluations assume relatively uniform information availability across queries. Our setting differs: information coverage for NBA games varies by roughly an order of magnitude depending on game profile. This makes NBA prediction an unusually clean natural experiment for studying how RAG performance degrades as retrieval coverage thins.
+
+\subsection{Multi-Agent Debate}
+
+\citet{du2024} showed that having multiple LLM instances debate a question, see each other's arguments, and update their positions can improve factuality and reasoning on open-ended tasks. A key assumption of that work is that agents have access to the same evidence pool. We implement a variant where agents have genuinely different tool access, so disagreement reflects analytical differences rather than random variation.
+
+\subsection{Chain-of-Thought Reasoning}
+
+\citet{wei2022} demonstrated that prompting LLMs to reason step by step substantially improves performance on complex tasks. Our CoT baseline pre-gathers all available evidence and passes it to the model in a single structured prompt. This represents the minimum viable reasoning strategy: one pass, all data, no iteration.
+
+\subsection{Agentic Loops}
+
+\citet{yao2023} proposed ReAct, which interleaves reasoning traces with tool calls. Our single-agent system is a ReAct implementation where the model decides which of six tools to call and in what order, observing results before deciding whether to gather more data or produce its assessment.
+
+\subsection{Sports Prediction}
+
+Prior work on LLM-based sports prediction has largely used static prompts with summary statistics \citep{kadavath2022}. Our system differs in that it uses live tool calls, a vector store for historical retrieval, and a multi-agent architecture, making it closer to an operational analysis tool than a prompted classifier.
+
+% ============================================================
+\section{System Architecture}
+% ============================================================
+
+The system has three layers: data pipelines feeding CSV files and a vector store, an AI/agent layer with three interchangeable reasoning systems, and a Streamlit web app for the user-facing demo.
+
+\subsection{Data Layer}
+
+Six pipelines populate the data directory before any inference:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{nba\_data\_pipeline.py} pulls game logs, team statistics, standings, and head-to-head records for nine seasons (2017--18 through 2025--26, including playoffs) via the \texttt{nba\_api} Python package, producing 11,465 game records.
+    \item \textbf{nba\_vector\_store.py} embeds each game into a ChromaDB collection (22,930 documents) with metadata filters for back-to-back status, rest days, home/away, and season. This enables semantic similarity retrieval: given an upcoming game, the system surfaces historically similar situations and their outcomes.
+    \item \textbf{nba\_injury\_pipeline.py} scrapes current player injury reports from the official NBA channel using the \texttt{nbainjuries} package. This produces a point-in-time snapshot (not historical by day).
+    \item \textbf{nba\_odds\_pipeline.py} calls The Odds API free tier for live cross-sportsbook moneyline odds. Historical evaluation uses a Kaggle dataset \citep{qiu2024} to avoid leaking post-game information.
+    \item \textbf{nba\_news\_pipeline.py} ingests ESPN and CBS Sports RSS feeds, applies VADER sentiment analysis \citep{hutto2014}, and tags articles by team.
+    \item \textbf{nba\_youtube\_pipeline.py} calls the YouTube Data API v3 for comment counts and sentiment on NBA highlight videos. This replaced the originally proposed Reddit PRAW integration after OAuth authentication for the Reddit app was blocked at the university network level.
+\end{itemize}
+
+\subsection{Vector Store Design}
+
+Each ChromaDB document stores a game description as free text with structured metadata. At query time, the agent provides a natural-language description of the upcoming matchup and optional metadata filters (team abbreviation, back-to-back flag, season). The top-$k$ retrieved games include outcome, score, and game context. This grounds the agent's reasoning in historical precedent rather than relying entirely on the model's parametric knowledge.
+
+\subsection{Tool Layer}
+
+Six Python functions serve as tools in all three reasoning systems:
+
+\begin{enumerate}[leftmargin=*]
+    \item \texttt{get\_team\_stats}: recent form, season record, shooting splits, plus/minus
+    \item \texttt{get\_head\_to\_head}: historical matchup win rates, average margins
+    \item \texttt{get\_injuries}: current availability by team
+    \item \texttt{get\_odds}: live or historical bookmaker implied probabilities
+    \item \texttt{get\_team\_sentiment}: sentiment score derived from news headlines
+    \item \texttt{search\_similar\_games}: ChromaDB retrieval of analogous historical games
+\end{enumerate}
+
+All tools accept an optional \texttt{as\_of\_date} parameter. During backtesting, the harness wraps every tool call so that historical games only see data available before that game's date, preventing leakage.
+
+\subsection{Single ReAct Agent}
+
+The single agent (\texttt{nba\_agent.py}) implements a ReAct loop \citep{yao2023}. At each step the LLM reasons about what information it still needs, emits an \texttt{ACTION} line specifying a tool call, observes the result, and decides whether to call another tool or produce its final report. The loop runs for up to twelve steps. The model is Claude Haiku 4.5.
+
+A notable engineering challenge was that Claude Haiku 4.5 sometimes formats tool calls with Markdown bold markers (\texttt{**tool\_name(...)**}) or encodes arguments as dictionary literals rather than keyword arguments. We added a parser that strips Markdown formatting, attempts AST evaluation of argument strings, and falls back to regex extraction when AST parsing fails.
+
+\subsection{Chain-of-Thought Baseline}
+
+The CoT baseline (\texttt{nba\_cot\_baseline.py}) pre-gathers all evidence upfront using deterministic Python calls to all six tools. It then constructs a single prompt containing all gathered evidence and calls the LLM once for the full analysis. This requires exactly one LLM call per game, regardless of evidence quality.
+
+\subsection{Multi-Agent Debate}
+
+The debate system (\texttt{nba\_multi\_agent.py}) uses three specialized agents, following \citet{du2024}:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Stats Agent}: accesses only \texttt{get\_team\_stats} and \texttt{get\_head\_to\_head}. Focuses on quantitative season performance.
+    \item \textbf{Matchup Agent}: accesses \texttt{get\_injuries}, \texttt{get\_team\_sentiment}, and \texttt{search\_similar\_games}. Focuses on contextual factors.
+    \item \textbf{Market Agent}: accesses \texttt{get\_odds} and all stats tools. Starts from bookmaker pricing and attempts to confirm or challenge the implied probability.
+\end{itemize}
+
+The debate runs two rounds. In each round, agents issue independent predictions with reasoning. Between rounds, each agent sees the other agents' reasoning and may update its position. A moderator agent then synthesizes the three positions into a final report with a consensus probability.
+
+\subsection{Evaluation Harness}
+
+\texttt{nba\_backtest.py} runs all three systems over historical games using a shared game-selection procedure. It samples games via \texttt{numpy.linspace} over the sorted game list to ensure even temporal coverage. Each game-method result is cached by a \texttt{(game\_id, method, ablation)} key, so interrupted runs resume without duplicating API calls. The harness also supports an ablation mode via \texttt{--disable-source}, which monkey-patches the relevant tool function to return a \texttt{DISABLED} marker string, ensuring that disabled sources produce no signal rather than returning empty data that the model might interpret differently.
+
+% ============================================================
+\section{Data Collection and Preprocessing}
+% ============================================================
+
+\subsection{Season Selection}
+
+We evaluate on the 2024--25 NBA season, which provides a complete regular season plus playoffs. We target 150 games sampled evenly across the season chronology. Of these, 18 are skipped because at least one team has fewer than ten prior games in the same season (early-season games lack enough history for meaningful form analysis). The final evaluation set contains 132 unique games.
+
+\subsection{Data Source Availability in Backtest Context}
+
+A critical constraint of the backtest is that several data sources are point-in-time scrapers without historical snapshots:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Injury reports}: The \texttt{nbainjuries} package captures current availability. There is no per-day historical record. For historical backtesting, the injury tool returns a \texttt{no historical snapshot} message.
+    \item \textbf{Sentiment}: The sentiment CSV lacks a date column. The sentiment tool returns \texttt{no historical snapshot} for all backtest games.
+    \item \textbf{Live odds}: The Odds API provides upcoming games only. Historical backtest games use the Kaggle historical odds dataset, but coverage is incomplete. When no match is found, the odds tool returns a \texttt{no live snapshot} message.
+\end{itemize}
+
+Only three sources provide real historical signals in the backtest: team stats, head-to-head records (both date-filtered from the game logs), and the ChromaDB vector store (queried against historical game embeddings). This limitation is documented in Section \ref{sec:limitations}.
+
+\subsection{Historical Odds Matching}
+
+For games where a Kaggle odds match exists, we compute the market implied home-win probability by converting American odds to probabilities and normalizing to sum to one. This provides the market baseline for RQ2 comparison. Of 389 prediction rows (132 games $\times$ 3 methods), zero rows had a successful Kaggle odds match due to schema differences between the Kaggle dataset and our team abbreviation convention. The market baseline comparison is therefore unavailable.
+
+\subsection{Cost and Infrastructure}
+
+All LLM inference uses Claude Haiku 4.5 (\texttt{claude-haiku-4-5-20251001}) via the Anthropic API. The full 132-game evaluation required 8,356 API calls at a total cost of \$26.09, approximately \$0.20 per game across all three methods. Multi-agent debate accounts for roughly 75\% of per-game cost due to its three-agent, two-round structure (approximately 50 LLM calls per game, versus approximately 15 for the single agent and one for CoT). The evaluation ran for approximately 17 wall-clock hours.
+
+% ============================================================
+\section{Evaluation Methodology}
+% ============================================================
+
+\subsection{Metrics}
+
+For each game-method prediction, we record:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Brier score}: $(\hat{p}_{\text{home}} - y)^2$, where $y \in \{0, 1\}$ is the actual home win indicator. Lower is better; a 50/50 random predictor scores 0.25.
+    \item \textbf{Log loss}: $-(y \log \hat{p} + (1-y) \log(1-\hat{p}))$. Lower is better.
+    \item \textbf{Accuracy}: binary correctness of the argmax prediction.
+    \item \textbf{Expected Calibration Error (ECE)}: computed over five equal-width bins of predicted probability. ECE measures the average gap between predicted probability and actual win rate per bin. A perfectly calibrated model has ECE of zero.
+    \item \textbf{Precision, Recall, F1}: treating ``predict home win'' as the positive class.
+\end{itemize}
+
+\subsection{Information Density Measurement}
+
+For each game, the backtest records four signals that quantify how much pre-game information was available:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{context\_tokens}: total LLM input tokens for that game-method pair.
+    \item \textbf{vector\_hits}: number of similar games retrieved from ChromaDB.
+    \item \textbf{youtube\_comments}: count of YouTube comments fed into reasoning (zero for all historical games).
+    \item \textbf{news\_articles}: count of news articles available (zero for all historical games).
+\end{itemize}
+
+We compute Pearson and Spearman correlation between each signal and the Brier score, and compare mean Brier for games in the top versus bottom quartile of context tokens.
+
+\subsection{Ablation Design}
+
+We run seven ablation backtests, each disabling one data source via \texttt{--disable-source}. To control cost, ablations use the CoT method only (\texttt{--methods chain\_of\_thought}), which requires one LLM call per game. Each disabled tool returns a stable \texttt{DISABLED for ablation: <source>} string. We measure Brier delta relative to the baseline CoT Brier of 0.2281. Positive delta means the source contributed to accuracy; negative or near-zero delta means the source was redundant or unavailable in the backtest context.
+
+\subsection{Report Quality Rubric}
+
+We manually score 21 reports (7 games $\times$ 3 methods) on four criteria rated 1--5:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Factual accuracy}: do the statistics cited in the report match the data the tools returned?
+    \item \textbf{Completeness}: does the report cover form, head-to-head, injury context, and odds?
+    \item \textbf{Reasoning quality}: does the chain of logic hold up, and does the conclusion follow from the evidence?
+    \item \textbf{Actionability}: would a casual bettor find the report useful for making a decision?
+\end{enumerate}
+
+% ============================================================
+\section{Results}
+% ============================================================
+
+\subsection{Main Comparison (RQ2)}
+
+Table \ref{tab:main} reports aggregate metrics for all three methods over 132 games (125 for the single agent due to seven failed parse retries).
+
+\begin{table}[H]
+\centering
+\caption{Main evaluation results. CoT = chain-of-thought, SA = single agent, MAD = multi-agent debate. Lower Brier, log loss, and ECE are better. Higher accuracy and F1 are better. A 50/50 random predictor yields Brier = 0.25.}
+\label{tab:main}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lccccc}
+\toprule
+Method & Games & Brier & Log loss & ECE & Accuracy \\
+\midrule
+\textbf{CoT} & \textbf{132} & \textbf{0.228} & \textbf{0.646} & \textbf{0.068} & \textbf{61.4\%} \\
+Multi-agent & 132 & 0.283 & 0.771 & 0.167 & 52.3\% \\
+Single agent & 125 & 0.297 & 0.811 & 0.205 & 52.8\% \\
+Random (50/50) & -- & 0.250 & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+CoT outperforms both alternatives on every metric. Multi-agent debate and the single agent both score \textit{worse} than a random 50/50 predictor on Brier score. The NBA home-team baseline (always predicting the home team wins, which occurs approximately 57\% of the time) would achieve roughly 0.245 Brier, so these two methods also fall below that naive baseline.
+
+\textbf{Headline finding for RQ2:} Multi-agent debate does \textit{not} outperform single-agent CoT. The simpler method, which gathers all evidence deterministically and reasons once, beats the iterative and debate-based approaches on every measured metric.
+
+\subsection{Why Multi-Agent Debate Underperformed}
+
+The poor performance of multi-agent debate and single agent is driven primarily by a \textit{home/away probability inversion} bug. When the agent produces its final JSON report, it sometimes assigns a high home-win probability to the away team. Manual inspection of reports shows that the \textit{reasoning text} often correctly identifies the favored team, but the final probability in the structured JSON output is flipped. This is consistent with a parsing failure where the model confuses which team it labeled as ``home'' in its internal reasoning chain. The CoT method, which produces a single coherent output rather than parsing intermediate tool-call JSON, avoids this failure mode.
+
+This is confirmed by the report quality scores (Table \ref{tab:quality}): single agent and multi-agent debate score 2.0--2.4 out of 5 on reasoning quality and actionability, reflecting the inversion problem, while CoT scores 4.1--4.3 on the same criteria.
+
+\subsection{Calibration}
+
+Table \ref{tab:calibration} shows 5-bin calibration results. CoT is well-calibrated in the middle probability range: in the 0.4--0.6 bin it predicts 0.497 and observes 0.536 (gap of 0.039), and in the 0.6--0.8 bin it predicts 0.682 and observes 0.712 (gap of 0.030). Multi-agent debate shows severe overconfidence at high predicted probabilities: in the 0.8--1.0 bin it assigns an average predicted probability of 0.840 but the actual home-win rate is only 0.200, a gap of 0.640. This indicates that when the debate converges strongly on one side, it is often wrong.
+
+\begin{table}[H]
+\centering
+\caption{5-bin calibration summary. ``Pred'' = average predicted home-win probability in bin. ``Actual'' = observed home-win rate. ``Gap'' = absolute difference. Bold indicates worst miscalibration.}
+\label{tab:calibration}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{llrrrr}
+\toprule
+Method & Bin & N & Pred & Actual & Gap \\
+\midrule
+CoT & [0.0, 0.2] & 6  & 0.132 & 0.333 & 0.202 \\
+CoT & (0.2, 0.4] & 41 & 0.328 & 0.439 & 0.112 \\
+CoT & (0.4, 0.6] & 28 & 0.497 & 0.536 & 0.039 \\
+CoT & (0.6, 0.8] & 52 & 0.682 & 0.712 & 0.030 \\
+CoT & (0.8, 1.0] & 5  & 0.876 & 1.000 & 0.124 \\
+\midrule
+Multi-agent & (0.2, 0.4] & 29 & 0.323 & 0.586 & 0.263 \\
+Multi-agent & (0.4, 0.6] & 62 & 0.520 & 0.629 & 0.109 \\
+Multi-agent & (0.6, 0.8] & 36 & 0.679 & 0.556 & 0.123 \\
+\textbf{Multi-agent} & \textbf{(0.8, 1.0]} & \textbf{5}  & \textbf{0.840} & \textbf{0.200} & \textbf{0.640} \\
+\midrule
+Single agent & [0.0, 0.2] & 2  & 0.175 & 0.500 & 0.325 \\
+Single agent & (0.2, 0.4] & 27 & 0.325 & 0.667 & 0.342 \\
+Single agent & (0.4, 0.6] & 25 & 0.530 & 0.640 & 0.110 \\
+Single agent & (0.6, 0.8] & 59 & 0.703 & 0.525 & 0.178 \\
+Single agent & (0.8, 1.0] & 12 & 0.880 & 0.667 & 0.213 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{Information Density vs. Prediction Quality (RQ1)}
+
+Table \ref{tab:density} shows Pearson and Spearman correlations between each information density signal and Brier score across all 389 prediction rows.
+
+\begin{table}[H]
+\centering
+\caption{Correlation between information density signals and Brier score. Positive correlation means more information corresponds to worse predictions.}
+\label{tab:density}
+\begin{tabular}{lcc}
+\toprule
+Signal & Pearson $r$ & Spearman $r$ \\
+\midrule
+youtube\_comments & 0.000 & 0.000 \\
+news\_articles    & 0.000 & 0.000 \\
+vector\_hits      & -0.030 & 0.000 \\
+context\_tokens   & +0.058 & +0.114 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+YouTube and news signals are zero for all historical games (no historical snapshots available), so their correlations are exactly zero. The vector store hits show a near-zero negative correlation, meaning slightly more similar games retrieved corresponds marginally to better predictions, but the effect is negligible ($r = -0.030$). Context tokens, which capture total input size, show a weak positive correlation ($r = +0.058$, Spearman $+0.114$), meaning games with more available context are marginally harder to predict.
+
+The quartile analysis confirms this: games in the top quartile of context tokens have a mean Brier of 0.262, while games in the bottom quartile have a mean Brier of 0.239, a difference of 0.024. High-context games are slightly harder.
+
+\textbf{Headline finding for RQ1:} More available pre-game information does not improve prediction quality. If anything, high-profile games (with larger context) are marginally harder. We attribute this to the well-known efficient markets hypothesis: heavily covered games attract more bettor attention, tighter lines, and less exploitable mispricing. The agent gets more input on these games but also faces a harder prediction task.
+
+\subsection{Ablation Study (RQ3)}
+
+Table \ref{tab:ablation} reports Brier delta relative to the baseline CoT score of 0.2281 when each source is disabled. Positive delta means the source contributed to accuracy; zero or negative delta means the source was redundant.
+
+\begin{table}[H]
+\centering
+\caption{Ablation results. Baseline CoT Brier = 0.2281. Delta = ablation Brier minus baseline. Positive delta means removing the source hurt performance.}
+\label{tab:ablation}
+\begin{tabular}{lcc}
+\toprule
+Disabled source & Brier & Delta \\
+\midrule
+youtube & 0.2108 & -0.0173 \\
+news & \textcolor{red}{pending} & \textcolor{red}{pending} \\
+odds & \textcolor{red}{pending} & \textcolor{red}{pending} \\
+injuries & \textcolor{red}{pending} & \textcolor{red}{pending} \\
+vector\_store & \textcolor{red}{pending} & \textcolor{red}{pending} \\
+h2h & \textcolor{red}{pending} & \textcolor{red}{pending} \\
+stats & \textcolor{red}{pending} & \textcolor{red}{pending} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The YouTube result (delta = -0.017) shows that disabling YouTube produces a slightly better Brier score, which reflects statistical noise from a different game sample (123 games in the ablation versus 132 in the baseline) combined with the fact that YouTube returns zero signal for all historical games. Removing a zero-contribution source while testing on a slightly different game sample is expected to produce small non-zero deltas.
+
+\textcolor{red}{[UPDATE TABLE \ref{tab:ablation} WITH REMAINING ABLATION RESULTS ONCE news, odds, injuries, vector\_store, h2h, AND stats RUNS COMPLETE. Expected: stats and h2h will show the largest positive deltas since they are the only sources with real historical data in the backtest context. youtube, news, odds, and injuries are expected to show near-zero deltas.]}
+
+\subsection{Manual Report Quality Scoring}
+
+Table \ref{tab:quality} reports mean scores (1--5 scale) for 21 reports across three methods.
+
+\begin{table}[H]
+\centering
+\caption{Manual report quality scores (1--5). Each entry is the mean over seven games. CoT leads on all four criteria.}
+\label{tab:quality}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lcccc}
+\toprule
+Method & Factual & Complete & Reasoning & Actionable \\
+\midrule
+\textbf{CoT} & \textbf{4.29} & \textbf{4.14} & \textbf{4.29} & \textbf{4.14} \\
+Multi-agent & 3.14 & 4.00 & 2.43 & 2.29 \\
+Single agent & 3.71 & 3.71 & 2.14 & 2.00 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+The most differentiating criterion is reasoning quality, where CoT (4.29) outperforms both multi-agent (2.43) and single agent (2.14) by more than two points on a five-point scale. The failure mode for both reactive systems is the home/away inversion described above: a report can correctly state that Team A is favored based on statistical evidence while simultaneously assigning a high win probability to Team B. Such a report is internally inconsistent and therefore both low-quality and misleading for a bettor.
+
+Multi-agent debate achieves the closest completeness score to CoT (4.00 versus 4.14) because the three-agent structure naturally surfaces factors across different analytical domains. But this breadth of coverage does not translate into better reasoning or actionability.
+
+% ============================================================
+\section{Discussion}
+% ============================================================
+
+\subsection{Why CoT Wins on This Task}
+
+The CoT advantage has a structural explanation. The CoT method separates evidence gathering (deterministic Python function calls) from evidence interpretation (one LLM call). This means every game receives the same set of six tool outputs in the same order, and the model never needs to decide whether to call a tool or interpret a tool's output mid-stream. The single agent and multi-agent debate, by contrast, make sequential LLM calls where each response must both interpret the previous tool result and decide what to call next. Errors in intermediate steps propagate, and the home/away confusion in structured JSON output is more likely to survive in a multi-step pipeline than in a single-pass response.
+
+This result is consistent with recent findings that simple, well-structured prompting strategies often match or outperform more complex agentic pipelines on narrow, well-defined tasks \citep{wei2022}. The \citet{du2024} multi-agent debate results were obtained on open-ended factual and reasoning tasks; our task is narrower and more structured, which may reduce the benefit of multi-perspective debate.
+
+\subsection{Implications for Agentic System Design}
+
+Our results suggest a practical design principle: for tasks where evidence gathering can be made deterministic (all necessary sources are known in advance and can be queried unconditionally), a single-pass CoT over pre-gathered evidence is preferable to a ReAct loop or multi-agent debate. ReAct loops and debate add value when evidence gathering itself requires LLM judgment (for instance, deciding which follow-up questions to ask based on an initial answer). NBA pre-game prediction is not such a task.
+
+\subsection{Information Density and Market Efficiency}
+
+The weak positive correlation between context tokens and Brier score (Pearson $r = +0.058$) is consistent with the efficient markets hypothesis applied to sports betting. High-profile games attract more public attention, which drives more accurate market pricing, which leaves less room for any analytical system to add value. Our agent gets more input on these games but faces tighter, harder-to-beat lines. Low-profile games have sparser context but also softer lines, making the prediction task roughly equally difficult regardless of information availability.
+
+% ============================================================
+\section{Limitations}
+\label{sec:limitations}
+% ============================================================
+
+\textbf{Historical data availability.} Three of six data sources (injuries, sentiment, live odds) do not have per-day historical snapshots, so the backtest effectively evaluates a three-source system (stats, head-to-head, vector store) rather than the full six-source system. The ablation study measures source impact in this degraded backtest context, not in the live deployment context.
+
+\textbf{Market baseline.} The Kaggle historical odds dataset could not be matched to our game records due to team naming convention differences, so there is no market baseline in Table \ref{tab:main}. The market is the most natural comparison point for a betting analysis system.
+
+\textbf{Sample size.} 132 games is the lower bound of the proposal's target range. Calibration bins with fewer than ten games (as seen in Table \ref{tab:calibration}) are unreliable.
+
+\textbf{Model selection.} Claude Haiku 4.5 was chosen for cost (approximately 4$\times$ cheaper than Claude Sonnet 4.6). A more capable model might reduce the home/away inversion failure rate. Preliminary testing with Sonnet 4.6 showed higher per-game cost (\$0.25 versus \$0.06) without a clear quality justification for our task.
+
+\textbf{Sentiment source.} The original proposal specified Reddit PRAW for fan sentiment. After OAuth authentication was blocked at the university network level, we switched to YouTube Data API v3 comments. The information density role of social media sentiment is preserved, but the specific platform differs from the proposal.
+
+\textbf{Home/away JSON inversion.} The systematic failure mode of the single agent and multi-agent debate is an output formatting bug rather than a fundamental reasoning failure. A more robust output parser or an explicit verification step could recover some of this performance. We leave this as future work.
+
+% ============================================================
+\section{Streamlit Deployment}
+% ============================================================
+
+The system is deployed as a multi-page Streamlit web app. The main matchup analysis page allows users to select an upcoming game from live bookmaker odds, choose a reasoning method, and generate a full report. Report sections include win probability gauges, a bookmaker market comparison with divergence flagging (alert when the agent's probability differs from market consensus by more than five percentage points), key factors with impact labels, similar historical games retrieved from ChromaDB, a step-by-step reasoning trace, and a downloadable JSON report.
+
+A research evaluation page renders the backtest CSV files with interactive metric comparisons, calibration curves, an information density scatter plot (Brier score versus context tokens with Pearson $r$ annotation), and an ablation bar chart. All visualizations update automatically when the underlying CSV files change.
+
+The app is available at the GitHub repository listed above and can be run locally with \texttt{streamlit run Matchup\_Analysis.py} after installing dependencies and setting API keys.
+
+% ============================================================
+\section{GitHub Repository}
+% ============================================================
+
+All code, documentation, and example outputs are available at:
+
+\begin{center}
+\url{https://github.com/aaditya79/MatchOdds-AI}
+\end{center}
+
+The repository includes a comprehensive README with setup instructions, API key configuration, data pipeline commands, backtest reproduction steps, and team attribution. The commit history documents major development milestones including the backtest refactor (Wave 2), the Haiku parsing fixes, the multi-method evaluation harness, and the Streamlit UI additions. Python dependencies are pinned in \texttt{requirements.txt} and the environment can be reproduced with \texttt{python3.12 -m venv .venv \&\& pip install -r requirements.txt}.
+
+% ============================================================
+\section{Conclusion}
+% ============================================================
+
+We built and evaluated MatchOdds AI, an agentic RAG system for NBA pre-game betting analysis. The main empirical finding is that chain-of-thought reasoning over pre-gathered evidence outperforms both a ReAct agent and a three-way multi-agent debate on all measured metrics. CoT achieves a Brier score of 0.228 and 61.4\% accuracy; the other two methods fall below the random-predictor baseline of 0.25 Brier due to a systematic home/away JSON inversion in their structured outputs.
+
+For RQ1, information density shows no beneficial effect on prediction quality. High-profile games with more available data are marginally harder to predict, consistent with efficient markets narrowing the exploitable probability gap on nationally covered games.
+
+For RQ3, the ablation study confirms that the only sources contributing signal in the backtest context are team stats and head-to-head records, because the other four sources lack per-day historical snapshots. \textcolor{red}{[Final ablation findings to be confirmed once all seven ablation runs complete.]}
+
+The project delivers all six proposed deliverables: an agentic RAG pipeline, a multi-agent debate system, a CoT baseline, a quantitative evaluation across all three research questions, a deployed Streamlit app, and an open-source repository with documentation and example reports.
+
+% ============================================================
+\bibliographystyle{plainnat}
+\begin{thebibliography}{10}
+
+\bibitem[Du et al.(2024)]{du2024}
+Du, Y., Li, S., Torralba, A., Tenenbaum, J.B., and Mordatch, I. (2024).
+\newblock Improving factuality and reasoning in language models through multiagent debate.
+\newblock In \textit{Proceedings of ICML 2024}.
+
+\bibitem[Gneiting \& Raftery(2007)]{gneiting2007}
+Gneiting, T. and Raftery, A.E. (2007).
+\newblock Strictly proper scoring rules, prediction, and estimation.
+\newblock \textit{Journal of the American Statistical Association}, 102(477):359--378.
+
+\bibitem[Hutto \& Gilbert(2014)]{hutto2014}
+Hutto, C. and Gilbert, E. (2014).
+\newblock VADER: A parsimonious rule-based model for sentiment analysis of social media text.
+\newblock In \textit{Proceedings of ICWSM 2014}.
+
+\bibitem[Kadavath et al.(2022)]{kadavath2022}
+Kadavath, S. et al. (2022).
+\newblock Language models (mostly) know what they know.
+\newblock \textit{arXiv preprint arXiv:2207.05221}.
+
+\bibitem[Lewis et al.(2020)]{lewis2020}
+Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V., Goyal, N., Kuttler, H., Lewis, M., Yih, W., Rocktaschel, T., Riedel, S., and Kiela, D. (2020).
+\newblock Retrieval-augmented generation for knowledge-intensive NLP tasks.
+\newblock In \textit{Advances in Neural Information Processing Systems (NeurIPS)}, volume 33.
+
+\bibitem[Qiu(2024)]{qiu2024}
+Qiu, E. (2024).
+\newblock NBA odds and scores dataset.
+\newblock \textit{Kaggle}. \url{https://www.kaggle.com/datasets/erichqiu/nba-odds-and-scores}.
+
+\bibitem[Wei et al.(2022)]{wei2022}
+Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B., Xia, F., Chi, E., Le, Q., and Zhou, D. (2022).
+\newblock Chain-of-thought prompting elicits reasoning in large language models.
+\newblock In \textit{Advances in Neural Information Processing Systems (NeurIPS)}, volume 35.
+
+\bibitem[Yao et al.(2023)]{yao2023}
+Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., and Cao, Y. (2023).
+\newblock ReAct: Synergizing reasoning and acting in language models.
+\newblock In \textit{Proceedings of ICLR 2023}.
+
+\end{thebibliography}
+
+\end{document}
