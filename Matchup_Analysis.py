@@ -894,6 +894,7 @@ def render_injury_summary(home_team, away_team):
 
                 comment = str(inj.get("comment", ""))[:110]
 
+                status = str(status) if status is not None else ""
                 color = "#ff6b6b" if status.lower() == "out" else "#ffd166"
 
                 rows.append(
