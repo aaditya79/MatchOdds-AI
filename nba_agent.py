@@ -17,10 +17,15 @@ Usage:
 Requires: steps 1-3 and 6 to be completed (data/ and chroma_db/ populated)
 """
 
+import ast
 import os
 import json
+import re
 import pandas as pd
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ============================================================
 # TOOL DEFINITIONS - each tool queries a different data source
@@ -31,6 +36,8 @@ DATA_DIR = "data"
 # Maximum number of characters retained from a tool observation before truncation.
 # Override at runtime via the NBA_MAX_OBSERVATION_CHARS env var.
 MAX_TOOL_OBSERVATION_CHARS = int(os.environ.get("NBA_MAX_OBSERVATION_CHARS", "3000"))
+
+_TEAM_ABBR_LOOKUP = None
 
 
 # ============================================================
@@ -115,6 +122,78 @@ def merge_info_density(target, observation_tool, observation_text):
     return target
 
 
+def normalize_season_label(season):
+    """Normalize common LLM season strings to NBA API form, e.g. 2024-25."""
+    if season is None:
+        return None
+
+    s = str(season).strip()
+    if re.fullmatch(r"\d{4}-\d{2}", s):
+        return s
+
+    match = re.fullmatch(r"(\d{4})[-/](\d{4})", s)
+    if match:
+        start, end = match.groups()
+        return f"{start}-{end[-2:]}"
+
+    match = re.fullmatch(r"(\d{4})[-/](\d{2})", s)
+    if match:
+        start, end = match.groups()
+        return f"{start}-{end}"
+
+    if re.fullmatch(r"\d{4}", s):
+        start_year = int(s)
+        return f"{start_year}-{str(start_year + 1)[-2:]}"
+
+    return s
+
+
+def normalize_team_abbreviation(team):
+    """Map full names / nicknames / cities to NBA abbreviations when possible."""
+    if team is None:
+        return None
+
+    raw = str(team).strip()
+    if not raw:
+        return raw
+
+    upper = raw.upper()
+    if re.fullmatch(r"[A-Z]{2,3}", upper):
+        return upper
+
+    global _TEAM_ABBR_LOOKUP
+    if _TEAM_ABBR_LOOKUP is None:
+        lookup = {
+            "la clippers": "LAC",
+            "l.a. clippers": "LAC",
+            "los angeles clippers": "LAC",
+            "la lakers": "LAL",
+            "l.a. lakers": "LAL",
+            "los angeles lakers": "LAL",
+            "indianapolis": "IND",
+        }
+        teams_path = f"{DATA_DIR}/teams.csv"
+        if os.path.exists(teams_path):
+            try:
+                teams = pd.read_csv(teams_path)
+                for _, row in teams.iterrows():
+                    abbr = str(row.get("abbreviation", "")).upper()
+                    if not abbr:
+                        continue
+                    for col in ("full_name", "nickname"):
+                        val = str(row.get(col, "")).strip().lower()
+                        if val:
+                            lookup[val] = abbr
+                    city = str(row.get("city", "")).strip().lower()
+                    if city and city != "los angeles":
+                        lookup.setdefault(city, abbr)
+            except Exception:
+                pass
+        _TEAM_ABBR_LOOKUP = lookup
+
+    return _TEAM_ABBR_LOOKUP.get(raw.lower(), raw)
+
+
 def tool_get_team_stats(team_abbr, season=None, as_of_date=None):
     """
     Get recent team stats and form.
@@ -124,6 +203,7 @@ def tool_get_team_stats(team_abbr, season=None, as_of_date=None):
     Streamlit behaviour (no filtering).
     """
     try:
+        team_abbr = normalize_team_abbreviation(team_abbr)
         game_logs = pd.read_csv(f"{DATA_DIR}/game_logs.csv")
         game_logs["GAME_DATE"] = pd.to_datetime(game_logs["GAME_DATE"], errors="coerce")
 
@@ -140,6 +220,8 @@ def tool_get_team_stats(team_abbr, season=None, as_of_date=None):
         if season is None:
             latest_row = team_all.sort_values("GAME_DATE", ascending=False).iloc[0]
             season = latest_row["SEASON"]
+        else:
+            season = normalize_season_label(season)
 
         team_games = (
             team_all[team_all["SEASON"] == season]
@@ -193,6 +275,8 @@ def tool_get_head_to_head(team1_abbr, team2_abbr, as_of_date=None):
     Streamlit behaviour.
     """
     try:
+        team1_abbr = normalize_team_abbreviation(team1_abbr)
+        team2_abbr = normalize_team_abbreviation(team2_abbr)
         h2h = pd.read_csv(f"{DATA_DIR}/head_to_head.csv")
 
         if as_of_date is not None:
@@ -300,6 +384,7 @@ def tool_get_team_sentiment(team_abbr, as_of_date=None):
     today's sentiment into a past prediction.
     """
     try:
+        team_abbr = normalize_team_abbreviation(team_abbr)
         sentiment = pd.read_csv(f"{DATA_DIR}/team_sentiment.csv")
 
         if as_of_date is not None:
@@ -421,7 +506,7 @@ def tool_search_similar_games(query_text, team=None, n_results=5, as_of_date=Non
 
         where_filter = None
         if team:
-            where_filter = {"team": team}
+            where_filter = {"team": normalize_team_abbreviation(team)}
 
         # Over-fetch when filtering so we can drop leaked rows and still
         # return n_results historically-valid hits.
@@ -550,25 +635,45 @@ def parse_action(text):
         return None, None, None
 
     action_line = text.split("ACTION:")[-1].strip().split("\n")[0]
+    action_line = action_line.strip().strip("`").strip()
+    action_line = action_line.lstrip("-• ").strip()
+    action_line = action_line.replace("**", "").strip()
 
     # Parse tool_name(arg1="val1", arg2="val2")
-    if "(" not in action_line:
+    match = re.search(
+        r"\b(get_team_stats|get_head_to_head|get_injuries|get_odds|search_similar_games|get_team_sentiment)\s*\(",
+        action_line,
+    )
+    if not match:
         return None, None, None
 
-    tool_name = action_line.split("(")[0].strip()
-    args_str = action_line.split("(", 1)[1].rsplit(")", 1)[0]
+    tool_name = match.group(1)
+    call_str = action_line[match.start():].strip()
+    args_str = call_str.split("(", 1)[1].rsplit(")", 1)[0]
 
     # Parse keyword arguments
     kwargs = {}
     if args_str.strip():
-        # Handle both key="value" and key=value formats
-        import re
-        pairs = re.findall(r'(\w+)\s*=\s*"([^"]*)"', args_str)
-        if not pairs:
-            pairs = re.findall(r'(\w+)\s*=\s*([^,\)]+)', args_str)
+        try:
+            parsed = ast.parse(f"_tool({args_str})", mode="eval").body
+            if parsed.args:
+                first_arg = ast.literal_eval(parsed.args[0])
+                if isinstance(first_arg, dict):
+                    kwargs.update(first_arg)
+            for keyword in parsed.keywords:
+                if keyword.arg is not None:
+                    kwargs[keyword.arg] = ast.literal_eval(keyword.value)
+        except (SyntaxError, ValueError, TypeError):
+            # Fallback for loose LLM formatting. Handles key="value",
+            # key='value', and key=value until the next comma.
+            pairs = re.findall(r'(\w+)\s*=\s*"([^"]*)"', args_str)
+            if not pairs:
+                pairs = re.findall(r"(\w+)\s*=\s*'([^']*)'", args_str)
+            if not pairs:
+                pairs = re.findall(r"(\w+)\s*=\s*([^,\)]+)", args_str)
 
-        for key, val in pairs:
-            kwargs[key.strip()] = val.strip().strip('"').strip("'")
+            for key, val in pairs:
+                kwargs[key.strip()] = val.strip().strip('"').strip("'")
 
     return tool_name, kwargs, action_line
 
