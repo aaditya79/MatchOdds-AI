@@ -1,261 +1,260 @@
 # MatchOdds AI
 
-**AI-powered NBA pre-game analysis comparing multi-agent debate, single-agent reasoning, and chain-of-thought baselines on real game data.**
+**An agentic RAG system for NBA pre-game betting analysis. Compares chain-of-thought, single ReAct agent, and multi-agent debate on 132 real historical games.**
 
-> For research purposes only. Not financial advice. Built for STAT GR5293 (GenAI) at Columbia University.
-
-![Python](https://img.shields.io/badge/Python-3.10+-blue)
-![Streamlit](https://img.shields.io/badge/Streamlit-App-red)
-![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector_Store-green)
+> For research purposes only. Not financial advice. Built for STAT GR5293 (Generative AI Using LLMs) at Columbia University, Spring 2026.
 
 ---
 
 ## What It Does
 
-Given an upcoming NBA game, MatchOdds AI gathers pre-game data from multiple sources (stats, injuries, odds, news sentiment, historically similar matchups), runs it through one of three reasoning systems, and produces a structured report with win probabilities, key factors, confidence, and a step-by-step reasoning chain.
+Given an upcoming NBA game, MatchOdds AI pulls pre-game data from six sources, passes it through one of three reasoning systems, and produces a structured report with win probabilities, key factors, a bookmaker market comparison, historically similar games, and a step-by-step reasoning trace.
 
-The system evaluates three analysis methods side by side:
+The system was built as a research platform to answer three questions:
 
-| Method | Description | LLM Calls |
-|--------|------------|-----------|
-| **Multi-Agent Debate** | Three specialized agents (Stats, Matchup, Market) with different tool access independently analyze, debate across two rounds, then a moderator synthesizes | ~15-20 |
-| **Single Agent (ReAct)** | One agent iteratively decides what data to gather, calls tools, and produces a report when it has enough evidence | ~5-8 |
-| **Chain-of-Thought** | All evidence gathered upfront and passed into a single reasoning pass | 1 |
+- **RQ1** — Does more pre-game information improve prediction quality, or do high-profile games become harder due to efficient markets?
+- **RQ2** — Does multi-agent debate with differentiated tool access outperform a single chain-of-thought pass?
+- **RQ3** — Which data sources actually contribute to Brier score, and which are redundant?
 
 ---
 
-## Key Features
+## Evaluation Results (132 games, 2024–25 NBA season)
 
-**User-facing analysis app**
-- Upcoming game selector with team logos
-- Live matchup analysis with team snapshots and recent form
-- Injury summary and media sentiment
-- Win probability visualization with circular gauges
-- Key factor breakdown with impact and importance labels
-- Side-by-side agent comparison (debate mode)
-- Live analysis trace during model execution
-- Downloadable JSON reports
+| Method | Brier ↓ | Log Loss ↓ | ECE ↓ | Accuracy ↑ |
+|---|---|---|---|---|
+| **CoT Baseline** | **0.228** | **0.646** | **0.068** | **61.4%** |
+| Multi-Agent Debate | 0.283 | 0.771 | 0.167 | 52.3% |
+| Single ReAct Agent | 0.297 | 0.811 | 0.205 | 52.8% |
+| Random (50/50) | 0.250 | — | — | — |
 
-**Research and evaluation page**
-- Historical backtesting across all three methods
-- Model comparison using accuracy, Brier score, log loss, calibration (ECE), F1, precision, recall, MAE
-- Calibration plots
-- Prediction-level inspection
-- Disagreement analysis across methods
-- Run-health reporting for incomplete runs
+CoT is the only method that beats the random-predictor Brier baseline of 0.25. Both agent-based methods fall below it, driven by a home/away label inversion in their structured JSON outputs. CoT avoids this by producing a single coherent generation.
 
-**Infrastructure**
-- Model output caching by (game, method) pair
-- Retry with exponential backoff for rate limits
-- Metadata logging for incomplete or partial runs
-- Reproducible evaluation workflow
+**Ablation (RQ3) — CoT Brier delta when each source is disabled:**
+
+| Disabled Source | Brier | Delta |
+|---|---|---|
+| h2h | 0.2385 | +0.010 |
+| stats | 0.2352 | +0.007 |
+| vector_store | 0.2338 | +0.006 |
+| injuries | 0.2252 | −0.003 (no historical data) |
+| odds | 0.2263 | −0.002 (no historical data) |
+| news | 0.2175 | −0.011 (no historical data) |
+| youtube | 0.2108 | −0.017 (no historical data) |
+
+The three sources with real historical snapshots (h2h, stats, vector store) all hurt performance when removed. The other four return no data for past games, so their deltas are sampling noise.
+
+**Total API cost:** $49.84 — $26.09 for the 132-game main eval (all 3 methods, 8,356 calls) + ~$23.75 for 7 CoT-only ablation sweeps. All inference uses Claude Haiku 4.5.
 
 ---
 
 ## Architecture
 
 ```
-+----------------------------------------------------+
-|                  Streamlit App                      |
-|   Matchup Analysis page   |   Research page        |
-+----------------------------------------------------+
-| Multi-Agent Debate | Single Agent | CoT Baseline   |
-+----------------------------------------------------+
-|                  Tool Layer                         |
-| get_team_stats | get_head_to_head | get_injuries   |
-| get_odds | get_team_sentiment | similar_games      |
-+----------------------------------------------------+
-|                  Data Layer                         |
-| nba_api | ESPN scraping | The Odds API | ChromaDB  |
-+----------------------------------------------------+
+┌─────────────────────────────────────────────┐
+│           React Frontend (Vite + TS)         │
+│  Matchup Analysis | Research | Simulation    │
+└─────────────────┬───────────────────────────┘
+                  │ HTTP / SSE
+┌─────────────────▼───────────────────────────┐
+│              FastAPI Backend                 │
+│  /games  /analysis  /backtest  /pipelines   │
+└─────────────────┬───────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────┐
+│    Three Reasoning Methods (Claude Haiku 4.5)│
+│  CoT Baseline | Single ReAct | Multi-Agent  │
+└─────────────────┬───────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────┐
+│           Tool Layer (6 functions)           │
+│  get_team_stats    | get_head_to_head       │
+│  get_injuries      | get_odds               │
+│  get_team_sentiment| search_similar_games   │
+└─────────────────┬───────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────┐
+│                Data Layer                    │
+│  nba_api (11,465 games, 9 seasons)          │
+│  ChromaDB (22,930 embedded game docs)       │
+│  The Odds API + Kaggle historical odds      │
+│  nbainjuries package                        │
+│  ESPN/CBS RSS feeds + VADER sentiment       │
+│  YouTube Data API v3 + Reddit public JSON   │
+└─────────────────────────────────────────────┘
 ```
 
-**Multi-Agent Debate:**
-- **Stats Agent** -- season record, recent form, efficiency, plus/minus. Only accesses quantitative data.
-- **Matchup Agent** -- injuries, context, and matchup-specific factors. Only accesses contextual data.
-- **Market Agent** -- starts from bookmaker framing and pricing when available.
+### Three Reasoning Methods
 
-Agents debate across two rounds and a moderator synthesizes the final prediction.
+| Method | LLM Calls/Game | Description |
+|---|---|---|
+| **CoT Baseline** | 1 | All six tools called deterministically upfront; single structured prompt passed to LLM |
+| **Single ReAct Agent** | ~5–12 | Model plans, calls tools one at a time, observes results, decides when to finalize |
+| **Multi-Agent Debate** | ~15–20 | Stats Agent + Matchup Agent + Market Agent each have differentiated tool access; 2 debate rounds; moderator synthesizes |
+
+All tools accept an `as_of_date` parameter. The backtest harness wraps every tool call so historical games only see data available before game day — no leakage.
 
 ---
 
 ## Data Sources
 
-| Source | Provider | Purpose |
-|--------|----------|---------|
-| Game and Team Stats | `nba_api` | Historical game logs, team performance, standings, head-to-head |
-| Injuries | ESPN (scraped) | Current player availability |
-| Betting Odds | The Odds API | Live odds from multiple sportsbooks |
-| Historical Similar Games | ChromaDB vector store | Retrieval of similar matchup contexts |
-| News / Sentiment | ESPN, NBA.com (scraped) | Recent team-level coverage and sentiment |
+| Source | Details |
+|---|---|
+| `nba_api` | 11,465 game records across 9 seasons (2017–18 through 2025–26, including playoffs) |
+| ChromaDB vector store | 22,930 embedded game documents with metadata filters (back-to-back, rest days, home/away, season) |
+| nbainjuries package | Current player availability (point-in-time; no per-day historical snapshots) |
+| The Odds API | Live cross-sportsbook moneyline odds; Kaggle historical dataset for backtesting |
+| ESPN + CBS Sports RSS | 81 articles ingested; VADER sentiment scoring per team |
+| YouTube Data API v3 | Comment counts and sentiment on NBA highlight videos |
+| Reddit public JSON | 1,567 comments via public endpoint (OAuth PRAW was blocked on university network) |
+
+**Note on backtest:** Only h2h, stats, and vector store provide real historical signals. Injuries, sentiment, odds, and YouTube return "no historical snapshot" for past games, so the backtest effectively evaluates a 3-source system for those runs.
 
 ---
 
 ## Setup
 
-### 1. Clone and install
+### Prerequisites
+
+- Python 3.10+
+- Node.js 18+ (for the React frontend)
+- Java (arm64 OpenJDK 18 required for `nbainjuries` on Apple Silicon):
+  ```bash
+  brew install openjdk@18
+  export JAVA_HOME=/opt/homebrew/opt/openjdk@18/libexec/openjdk.jdk/Contents/Home
+  ```
+
+### 1. Clone and install Python dependencies
 
 ```bash
 git clone https://github.com/aaditya79/MatchOdds-AI.git
 cd MatchOdds-AI
+python3.12 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ### 2. Set API keys
 
 ```bash
-# LLM backend (pick one)
-export ANTHROPIC_API_KEY="sk-ant-..."
-# or
-export OPENAI_API_KEY="sk-..."
-
-# Optional: live odds
-export ODDS_API_KEY="your_key_here"
+cp .env.example .env
+# Fill in:
+# ANTHROPIC_API_KEY=sk-ant-...
+# ODDS_API_KEY=...
+# YOUTUBE_API_KEY=...
 ```
 
-### 3. Build the data pipeline
-
-Run these in order:
+### 3. Populate data (run once)
 
 ```bash
-python3 nba_data_pipeline.py         # historical NBA data
-python3 nba_injury_pipeline.py       # current injuries
-python3 nba_odds_pipeline.py         # live odds
-python3 nba_news_pipeline.py         # news + sentiment inputs
-python3 nba_vector_store.py          # ChromaDB build
+python nba_data_pipeline.py       # ~60 min, nba_api rate limits
+python nba_vector_store.py        # embeds 22,930 game docs into ChromaDB
+python nba_news_pipeline.py       # ESPN/CBS RSS
+python nba_reddit_pipeline.py     # Reddit public JSON
+python nba_injury_pipeline.py     # requires JAVA_HOME set
+python nba_odds_pipeline.py       # The Odds API
+```
+
+### 4. Start the backend
+
+```bash
+cd backend
+pip install -r requirements.txt
+./run.sh
+# FastAPI runs at http://localhost:8000
+```
+
+### 5. Start the frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+# React app runs at http://localhost:5173
 ```
 
 ---
 
-## Running the App
+## Backtesting
 
 ```bash
-streamlit run Matchup_Analysis.py
+# Smoke test (~5 games, ~$0.30)
+python nba_backtest.py --n-games 5 --season 2024-25
+
+# Full eval (132 games, ~17 hours, ~$26)
+python nba_backtest.py --n-games 150 --season 2024-25
+
+# Ablation sweep (disable one source at a time, CoT only)
+for src in h2h stats vector_store odds injuries news youtube; do
+  python nba_backtest.py --n-games 150 --season 2024-25 --disable-source "$src"
+done
 ```
 
-This launches the main user-facing app at `http://localhost:8501`.
+Results are cached by `(game_id, method, ablation)` key — interrupted runs resume without duplicating API calls.
 
-The research and evaluation page is accessible from the sidebar within the app.
-
----
-
-## Backtesting and Evaluation
-
-The research workflow evaluates all three reasoning methods on historical games using only information available before each game.
-
-**Metrics tracked:**
-- Accuracy, precision, recall, F1
-- Log loss, Brier score, MAE on predicted probabilities
-- Calibration / ECE
-- Prediction gap and confidence patterns
-
-**Run a backtest:**
-
-```bash
-python3 nba_backtest.py --n-games 25 --season 2025-26
-```
-
-**Outputs:**
-- `data/backtest_predictions.csv` -- per-game predictions and outcomes
-- `data/backtest_summary.csv` -- aggregated metrics by method
-- `data/backtest_calibration.csv` -- calibration bin data
-- `data/backtest_run_metadata.json` -- run metadata and completion status
-
-**Robustness features:**
-- Cache by game/method in `data/backtest_cache/`
-- Retry with exponential backoff for transient API failures
-- Incomplete-run reporting in the research UI
-
----
-
-## Run Individual Components
-
-```bash
-python3 nba_agent.py                 # single-agent analysis
-python3 nba_multi_agent.py           # multi-agent debate
-python3 nba_cot_baseline.py          # chain-of-thought baseline
-python3 nba_backtest.py              # historical backtest
-```
+**Output files:**
+- `data/backtest_predictions.csv` — per-game predictions and outcomes
+- `data/backtest_summary.csv` — aggregated metrics by method
+- `data/backtest_calibration.csv` — 5-bin calibration data
+- `data/backtest_ablation_<source>.csv` — per-ablation results
+- `data/backtest_run_metadata.json` — run stats and completion status
+- `data/llm_calls.jsonl` — per-call cost log
 
 ---
 
 ## Project Structure
 
 ```
-matchodds-ai/
-├── Matchup_Analysis.py              # main Streamlit matchup analysis app
-├── pages/
-│   └── Research_Evaluation.py       # research / backtesting page
-├── nba_data_pipeline.py             # Step 1: historical nba_api data collection
-├── nba_injury_pipeline.py           # Step 2: ESPN injury scraping
-├── nba_odds_pipeline.py             # Step 3: The Odds API integration
-├── nba_news_pipeline.py             # Step 5: news scraping + sentiment inputs
-├── nba_vector_store.py              # Step 6: ChromaDB vector store
-├── nba_agent.py                     # Step 7: single-agent reasoning system
-├── nba_multi_agent.py               # Step 8: multi-agent debate system
-├── nba_cot_baseline.py              # Step 9: chain-of-thought baseline
-├── nba_backtest.py                  # historical evaluation script
-├── data/
-│   ├── game_logs.csv
-│   ├── team_stats.csv
-│   ├── standings.csv
-│   ├── head_to_head.csv
-│   ├── injuries.csv
-│   ├── odds_live.csv
-│   ├── news_articles.csv
-│   ├── team_sentiment.csv
-│   ├── backtest_predictions.csv
-│   ├── backtest_summary.csv
-│   ├── backtest_calibration.csv
-│   ├── backtest_run_metadata.json
-│   └── backtest_cache/
-├── chroma_db/                       # ChromaDB persistent storage
-├── requirements.txt
-└── README.md
+MatchOdds-AI/
+├── frontend/                    # React + TypeScript UI (Vite)
+│   └── src/pages/
+│       ├── MatchupPage.tsx      # main analysis UI
+│       ├── ResearchPage.tsx     # backtest results, calibration, ablation
+│       └── SimulationPage.tsx   # betting simulation
+├── backend/                     # FastAPI server
+│   └── app/
+│       ├── routers/             # /games /analysis /backtest /pipelines
+│       └── services/            # analysis, backtest, LLM wrappers
+├── nba_agent.py                 # single ReAct agent
+├── nba_multi_agent.py           # multi-agent debate (3 agents x 2 rounds)
+├── nba_cot_baseline.py          # chain-of-thought baseline
+├── nba_backtest.py              # evaluation harness
+├── nba_cost_logger.py           # per-call cost tracking
+├── nba_data_pipeline.py         # nba_api historical data
+├── nba_vector_store.py          # ChromaDB indexing
+├── nba_injury_pipeline.py       # nbainjuries scraper
+├── nba_odds_pipeline.py         # The Odds API + Kaggle
+├── nba_news_pipeline.py         # ESPN/CBS RSS + VADER
+├── nba_reddit_pipeline.py       # Reddit public JSON
+├── nba_youtube_pipeline.py      # YouTube Data API v3
+├── data/sample/                 # example CSVs for reproducibility
+├── fig_brier_bar.png            # publication figure
+├── fig_calibration.png          # publication figure
+├── fig_density.png              # publication figure
+├── fig_ablation.png             # publication figure
+├── report.tex                   # LaTeX source
+├── report.pdf                   # compiled paper
+└── requirements.txt
 ```
 
 ---
 
-## Research Questions
+## Key Findings
 
-**RQ1:** How does prediction quality relate to information density?
-
-**RQ2:** Does multi-agent debate with differentiated reasoning outperform simpler single-agent baselines?
-
-**RQ3 (Extension):** How well calibrated are the model probabilities, not just how accurate are the picks?
-
-**RQ4 (Extension):** When the three reasoning styles disagree, what kinds of matchups create the largest uncertainty?
-
----
-
-## Requirements
-
-```
-nba_api
-pandas
-requests
-beautifulsoup4
-feedparser
-chromadb
-anthropic              # or openai
-streamlit
-matplotlib
-```
-
-Optional:
-
-```
-vaderSentiment
-praw
-```
+- **CoT wins on every metric.** One structured pass over pre-gathered evidence outperforms both iterative tool-calling and multi-agent debate on Brier, log loss, ECE, and accuracy.
+- **Both agent methods fall below the random baseline on Brier.** The home/away label inversion in their structured JSON outputs systematically corrupts predictions. CoT avoids this by producing a single coherent generation with no intermediate JSON parsing.
+- **More data does not help.** Information density (context tokens, vector hits, article count) shows near-zero correlation with Brier score (Pearson r = +0.058). High-profile games are marginally harder to predict, consistent with efficient markets tightening the lines.
+- **h2h, stats, and vector store are the only sources that matter for backtesting.** The other four sources return no historical snapshots, so their ablation deltas reflect sample noise rather than genuine signal.
+- **Agents degrade on back-to-back games.** CoT is stable (Brier delta −0.011 on B2B games); multi-agent (+0.033) and single agent (+0.073) both degrade substantially.
 
 ---
 
 ## Team
 
-- **Pranav Jain** -- data pipeline, vector store, CoT baseline
-- **Aaditya Pai** -- agent architecture, multi-agent debate, backtesting, evaluation
-- **Tanish Patel** -- Streamlit app, deployment, UI/report quality
+| Member | Contributions |
+|---|---|
+| **Aaditya Pai** | Agent architecture, multi-agent debate, backtesting harness, evaluation, ablations, report |
+| **Pranav Jain** | Data pipelines, vector store, CoT baseline |
+| **Tanish Patel** | React frontend, FastAPI backend, deployment |
 
 STAT GR5293: Generative AI Using LLMs | Spring 2026 | Columbia University
 
@@ -263,8 +262,9 @@ STAT GR5293: Generative AI Using LLMs | Spring 2026 | Columbia University
 
 ## References
 
-1. Du, Y., Li, S., Torralba, A., Tenenbaum, J. B., and Mordatch, I. (2024). Improving factuality and reasoning in language models through multiagent debate. *ICML 2024*.
-2. Lewis, P. et al. (2020). Retrieval-augmented generation for knowledge-intensive NLP tasks. *NeurIPS 2020*.
-3. Wei, J. et al. (2022). Chain-of-thought prompting elicits reasoning in large language models. *NeurIPS 2022*.
-4. Yao, S. et al. (2023). ReAct: Synergizing reasoning and acting in language models. *ICLR 2023*.
-5. Gneiting, T. and Raftery, A. E. (2007). Strictly proper scoring rules, prediction, and estimation. *JASA*, 102(477), 359-378.
+1. Du et al. (2024). Improving factuality and reasoning in language models through multiagent debate. *ICML 2024*.
+2. Lewis et al. (2020). Retrieval-augmented generation for knowledge-intensive NLP tasks. *NeurIPS 2020*.
+3. Wei et al. (2022). Chain-of-thought prompting elicits reasoning in large language models. *NeurIPS 2022*.
+4. Yao et al. (2023). ReAct: Synergizing reasoning and acting in language models. *ICLR 2023*.
+5. Hutto & Gilbert (2014). VADER: A parsimonious rule-based model for sentiment analysis of social media text. *ICWSM 2014*.
+6. Qiu, E. (2024). NBA odds and scores dataset. Kaggle.
