@@ -335,6 +335,29 @@ Single agent & 3.71 & 3.71 & 2.14 & 2.00 \\
 
 CoT leads on all four qualitative criteria. The largest gap is reasoning quality, where CoT outperforms both reactive systems by more than two points.
 
+\subsection{Secondary Breakdowns}
+
+Of the 132 evaluation games, 32 (24\%) involved at least one team playing on consecutive nights (back-to-back). Table \ref{tab:b2b} shows per-method Brier by this slice.
+
+\begin{table}[H]
+\centering
+\caption{Brier score by back-to-back status.}
+\label{tab:b2b}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lccc}
+\toprule
+Method & Non-B2B (n=100) & B2B (n=32) & Delta \\
+\midrule
+CoT & 0.231 & 0.220 & -0.011 \\
+Multi-agent & 0.275 & 0.308 & +0.033 \\
+Single agent & 0.279 & 0.352 & +0.073 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+CoT is stable across back-to-back and non-back-to-back games (delta $-0.011$), while both agent-based methods degrade substantially on back-to-back games. This is consistent with the home/away inversion failure mode being more pronounced in scheduling-complex situations. Star player absence breakdowns are not reported because the backtest has no per-day historical injury snapshots.
+
 % ============================================================
 \section{Discussion}
 % ============================================================

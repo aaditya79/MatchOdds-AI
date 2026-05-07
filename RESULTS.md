@@ -239,10 +239,12 @@ Back-to-back and star-absence flags are not tracked in the backtest output CSV. 
 
 | Slice | Games | Best method | Brier |
 |---|---|---|---|
-| Back-to-back games | not tracked | — | — |
-| Non-back-to-back | not tracked | — | — |
+| Back-to-back games (n=32) | CoT 0.220 / MAD 0.308 / SA 0.352 | CoT | — |
+| Non-back-to-back (n=100) | CoT 0.231 / MAD 0.275 / SA 0.279 | CoT | — |
 | High-profile games (top quartile context tokens) | 97 | CoT | 0.262 |
 | Low-profile games (bottom quartile context tokens) | 97 | CoT | 0.239 |
+
+**Key finding:** CoT is stable across B2B and non-B2B games (delta -0.011). Both agent methods degrade significantly on B2B games (multi-agent +0.033, single agent +0.073), consistent with the home/away inversion bug being amplified in scheduling-complex situations. Star player absence breakdowns unavailable — no per-day historical injury snapshots.
 
 ---
 
