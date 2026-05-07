@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  ArrowRight,
+  CloudDownload,
+  Database,
   Download,
   Loader2,
   Play,
@@ -29,8 +33,60 @@ import type {
 } from "@/types";
 
 export default function MatchupPage() {
+  const qc = useQueryClient();
   const upcoming = useQuery({ queryKey: ["upcoming"], queryFn: api.upcoming });
   const games = upcoming.data ?? [];
+
+  const [pipelineMessage, setPipelineMessage] = useState<{
+    tone: "ok" | "warn" | "error";
+    text: string;
+  } | null>(null);
+
+  const refreshOddsMut = useMutation({
+    mutationFn: api.refreshOdds,
+    onSuccess: (res) => {
+      if (res.ok) {
+        setPipelineMessage({ tone: "ok", text: "Live odds refresh started. Status updates on the Data page." });
+        qc.invalidateQueries({ queryKey: ["upcoming"] });
+        qc.invalidateQueries({ queryKey: ["pipelines-status"] });
+      } else if (res.rate_limited) {
+        setPipelineMessage({
+          tone: "warn",
+          text: `Cooldown active. Try again in ${res.cooldown_remaining ?? 60}s.`,
+        });
+      } else {
+        setPipelineMessage({
+          tone: "error",
+          text: res.error ?? "Odds pipeline failed. See server logs for details.",
+        });
+      }
+    },
+    onError: (err: unknown) => {
+      const message = err instanceof Error ? err.message : "Refresh failed";
+      setPipelineMessage({ tone: "error", text: message });
+    },
+  });
+
+  // Polled pipeline status — used to detect when the data pipelines haven't
+  // been run yet so we can surface a setup banner.
+  const pipelineStatuses = useQuery({
+    queryKey: ["pipelines-status"],
+    queryFn: api.pipelinesStatus,
+    refetchInterval: 10_000,
+  });
+  const missingArtifacts = useMemo(() => {
+    const data = pipelineStatuses.data;
+    if (!data) return [];
+    const required = ["data", "vector_store"] as const;
+    const out: { name: string; missing: string[] }[] = [];
+    for (const name of required) {
+      const s = data[name];
+      if (!s) continue;
+      const missing = s.produces_present.filter((p) => !p.exists).map((p) => p.path);
+      if (missing.length > 0) out.push({ name: s.title, missing });
+    }
+    return out;
+  }, [pipelineStatuses.data]);
 
   const [selectedId, setSelectedId] = useState<string | undefined>();
   useEffect(() => {
@@ -173,6 +229,31 @@ export default function MatchupPage() {
     <div className="space-y-6">
       <Hero />
 
+      {missingArtifacts.length > 0 && (
+        <div className="flex flex-col gap-3 rounded-2xl border border-warn/30 bg-warn/[0.06] p-5 text-sm text-warn md:flex-row md:items-center md:justify-between">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <div>
+              <strong>First-time setup needed.</strong> The agent tools read CSVs and a
+              ChromaDB collection that haven't been built yet:
+              <ul className="mt-1 list-disc space-y-0.5 pl-4 text-xs text-warn/80">
+                {missingArtifacts.map((m) => (
+                  <li key={m.name}>
+                    <span className="font-mono">{m.missing.join(", ")}</span>{" "}
+                    <span className="text-warn/60">({m.name})</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+          <Link to="/data" className="btn-primary shrink-0">
+            <Database className="h-4 w-4" />
+            Open Data page
+            <ArrowRight className="h-4 w-4" />
+          </Link>
+        </div>
+      )}
+
       <Panel
         title="Select Game"
         subtitle={
@@ -181,21 +262,53 @@ export default function MatchupPage() {
             : "Pick an upcoming matchup to analyse"
         }
         action={
-          <button
-            type="button"
-            onClick={() => upcoming.refetch()}
-            className="btn-ghost px-3 py-2 text-xs"
-            title="Refresh upcoming games"
-          >
-            <RefreshCw className="h-3.5 w-3.5" /> Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setPipelineMessage(null);
+                refreshOddsMut.mutate();
+              }}
+              disabled={refreshOddsMut.isPending}
+              className="btn-ghost px-3 py-2 text-xs"
+              title="Re-run nba_odds_pipeline.py to refresh today's slate (60s cooldown)"
+            >
+              {refreshOddsMut.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <CloudDownload className="h-3.5 w-3.5" />
+              )}
+              Refresh odds
+            </button>
+            <button
+              type="button"
+              onClick={() => upcoming.refetch()}
+              className="btn-ghost px-3 py-2 text-xs"
+              title="Re-read odds_live.csv from disk"
+            >
+              <RefreshCw className="h-3.5 w-3.5" /> Reload list
+            </button>
+          </div>
         }
       >
+        {pipelineMessage && (
+          <div
+            className={`mb-3 rounded-xl border px-3 py-2 text-xs ${
+              pipelineMessage.tone === "ok"
+                ? "border-win/30 bg-win/5 text-win"
+                : pipelineMessage.tone === "warn"
+                ? "border-warn/30 bg-warn/5 text-warn"
+                : "border-loss/30 bg-loss/5 text-loss"
+            }`}
+          >
+            {pipelineMessage.text}
+          </div>
+        )}
         <GamePicker
           games={games as UpcomingGame[]}
           value={selectedId}
           onChange={setSelectedId}
-          loading={upcoming.isLoading}
+          loading={upcoming.isLoading || refreshOddsMut.isPending}
         />
       </Panel>
 

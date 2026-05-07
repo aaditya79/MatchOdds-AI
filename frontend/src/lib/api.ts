@@ -13,6 +13,9 @@ import type {
   MarketConsensus,
   MatchupBundle,
   ParsedReport,
+  PipelineName,
+  PipelineStartResponse,
+  PipelineStatus,
   PredictionRow,
   RoiResponse,
   SimilarGame,
@@ -78,6 +81,12 @@ export const api = {
   backtestAblations: () => get<AblationRow[]>("/backtest/ablations"),
   backtestRun: (req: { n_games: number; season: string; min_history: number }) =>
     post<{ ok: boolean; output: string }>("/backtest/run", req),
+  pipelinesStatus: () =>
+    get<Record<PipelineName, PipelineStatus>>("/pipelines/status"),
+  pipelineStart: (name: PipelineName) =>
+    post<PipelineStartResponse>(`/pipelines/${name}`),
+  // Convenience wrapper used by the Refresh-odds button on the matchup page.
+  refreshOdds: () => post<PipelineStartResponse>("/pipelines/odds"),
   simulateRoi: (params: {
     method?: string;
     edge_threshold?: number;
