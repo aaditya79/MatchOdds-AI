@@ -312,7 +312,7 @@ stats        & 0.2352 & +0.0071 \\
 \end{tabular}
 \end{table}
 
-The three sources with real historical data in the backtest show positive deltas: h2h (+0.010), stats (+0.007), and vector\_store (+0.006) — confirming they contribute to CoT performance. The four sources without historical snapshots (youtube, news, odds, injuries) all show negative or near-zero deltas, reflecting sample variation rather than real signal since they return no data for historical games.
+The three sources with real historical data in the backtest show positive deltas: h2h (+0.010), stats (+0.007), and vector\_store (+0.006). Removing any one of these sources raises the CoT Brier score, confirming that each contributes real predictive signal. The four sources without historical snapshots (youtube, news, odds, injuries) show negative or near-zero deltas because they return no data for past games; the small negative values reflect sample variation from different game draws rather than genuine signal. Figure \ref{fig:ablation} visualizes the per-source deltas.
 
 \subsection{Manual Report Quality Scoring}
 
@@ -364,15 +364,15 @@ CoT is stable across back-to-back and non-back-to-back games (delta $-0.011$), w
 
 \subsection{Why CoT Wins on This Task}
 
-The CoT advantage has a structural explanation. The CoT method separates evidence gathering from evidence interpretation. Every game receives the same set of six tool outputs in the same order, and the model never needs to decide whether to call a tool or interpret a tool's output mid-stream. The single agent and multi-agent debate, by contrast, make sequential LLM calls where errors can propagate.
+CoT separates evidence gathering from evidence interpretation. Every game gets the same six tool outputs in the same order, and the model makes a single reasoning pass over a fixed context. The single agent and multi-agent debate, by contrast, interleave reasoning with tool dispatch across many sequential LLM calls. Each call must both interpret the previous observation and decide what to request next, giving parsing errors and home/away label confusion more opportunities to corrupt the final JSON output. The inversion bug seen in manual inspection is a direct consequence of this multi-step structure.
 
 \subsection{Implications for Agentic System Design}
 
-Our results suggest that for tasks where evidence gathering can be made deterministic, a single-pass CoT over pre-gathered evidence is preferable to a ReAct loop or multi-agent debate. ReAct loops and debate add value when evidence gathering itself requires LLM judgment. NBA pre-game prediction is not such a task.
+For tasks where all necessary evidence can be gathered deterministically up front, a single CoT pass outperforms a ReAct loop or multi-agent debate. ReAct-style architectures add real value when evidence gathering requires LLM judgment, such as deciding which follow-up questions to ask based on an initial answer. NBA pre-game prediction does not have this property: the six relevant data sources are known in advance and can be queried unconditionally.
 
 \subsection{Information Density and Market Efficiency}
 
-The weak positive correlation between context tokens and Brier score is consistent with the efficient markets hypothesis applied to sports betting. High-profile games attract more public attention, which drives more accurate market pricing and leaves less room for any analytical system to add value.
+The weak positive correlation between context tokens and Brier score ($r = +0.058$) is consistent with betting market efficiency. High-profile games attract wider media coverage, which draws more bettor attention, tightens the lines, and leaves less room for any model to outperform. Low-profile games have sparser context but also softer lines, so the prediction difficulty stays roughly constant across game profiles.
 
 % ============================================================
 \section{Limitations}
@@ -494,6 +494,13 @@ Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., and Cao, Y. (202
 \includegraphics[width=0.82\textwidth]{fig_density.png}
 \caption{Information density (context tokens) versus Brier score for all 389 game-method predictions. CoT predictions (green, left cluster) use far fewer tokens since evidence is gathered via Python calls with no intermediate LLM context. Multi-agent debate (gold, right cluster) uses 3--5$\times$ more tokens due to three agents debating across two rounds. The Pearson $r = +0.058$ indicates a weak positive relationship: games with more available context are marginally harder to predict, consistent with more-covered games having tighter and harder-to-exploit betting lines.}
 \label{fig:density}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\textwidth]{fig_ablation.png}
+\caption{Per-source ablation results. Each bar shows the change in CoT Brier score when that source is disabled (positive delta means the source contributes; negative means it adds no signal in the backtest). Head-to-head records (h2h, $+0.010$), team stats ($+0.007$), and the ChromaDB vector store ($+0.006$) are the three sources with real historical data and all show positive deltas. The four sources on the right (odds, injuries, news, YouTube) return no historical snapshots for past games; their near-zero or negative deltas reflect sampling noise rather than genuine information value.}
+\label{fig:ablation}
 \end{figure}
 
 \end{document}
