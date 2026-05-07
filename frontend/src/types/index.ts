@@ -89,6 +89,11 @@ export interface KeyFactor {
   impact: "favors_home" | "favors_away" | "neutral" | string;
   importance: "high" | "medium" | "low" | string;
   source_agent?: string;
+  // Optional enrichment fields added by the FastAPI backend after parsing.
+  influence_score?: number; // 0..100
+  metric_label?: string; // e.g. "Net rating Δ"
+  metric_value?: string; // e.g. "+8.4"
+  category?: string;
 }
 
 export interface AgentAnalysis {
@@ -201,4 +206,31 @@ export interface RoiResponse {
   available: boolean;
   summary: RoiSummaryRow[];
   bets: RoiBet[];
+}
+
+export type PipelineName = "data" | "injuries" | "odds" | "news" | "vector_store";
+
+export interface PipelineStatus {
+  name: PipelineName;
+  title: string;
+  description: string;
+  eta: string;
+  status: "idle" | "running" | "done" | "error" | "timeout";
+  started_at: number | null;
+  finished_at: number | null;
+  last_run_at: number | null;
+  exit_code: number | null;
+  duration_seconds: number | null;
+  cooldown_remaining: number;
+  produces: string[];
+  produces_present: { path: string; exists: boolean }[];
+  output_tail: string[];
+}
+
+export interface PipelineStartResponse {
+  ok: boolean;
+  error?: string;
+  rate_limited?: boolean;
+  cooldown_remaining?: number;
+  status?: PipelineStatus;
 }

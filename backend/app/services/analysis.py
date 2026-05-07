@@ -22,6 +22,41 @@ from nba_agent import run_agent  # type: ignore
 from nba_multi_agent import run_full_debate, AGENTS  # type: ignore  # noqa: F401
 from nba_cot_baseline import run_cot_analysis  # type: ignore
 
+# Best-effort enrichment: we never let it break the existing response.
+try:
+    from app.services.factor_enrichment import enrich_report
+    from app.services import data_tools as _data_tools
+except Exception:  # pragma: no cover — defensive only
+    enrich_report = None  # type: ignore[assignment]
+    _data_tools = None  # type: ignore[assignment]
+
+
+def _safe_enrich(report, home_abbr: str, away_abbr: str, home_name: str, away_name: str):
+    """Add ``metric_label`` / ``metric_value`` / ``influence_score`` to factors.
+
+    Always defensive: any exception leaves the report exactly as the agent
+    produced it. The contract for callers — and for the existing Streamlit
+    pages — is unchanged.
+    """
+    if enrich_report is None or _data_tools is None or not isinstance(report, dict):
+        return report
+    try:
+        home_stats = _data_tools.get_team_stats(home_abbr) if home_abbr else {}
+    except Exception:
+        home_stats = {}
+    try:
+        away_stats = _data_tools.get_team_stats(away_abbr) if away_abbr else {}
+    except Exception:
+        away_stats = {}
+    try:
+        h2h = _data_tools.get_head_to_head(home_abbr, away_abbr) if home_abbr and away_abbr else {}
+    except Exception:
+        h2h = {}
+    try:
+        return enrich_report(report, home_stats=home_stats, away_stats=away_stats, h2h=h2h)
+    except Exception:
+        return report
+
 
 # ---------------------------------------------------------------------------
 # Trace writer + report parser
@@ -205,6 +240,7 @@ def stream_analysis(
     payload = container.get("payload", {})
     raw = payload.get("raw", "")
     report = parse_report(raw)
+    report = _safe_enrich(report, home_abbr, away_abbr, home_name, away_name)
     yield {
         "event": "done",
         "report": report,
@@ -237,8 +273,10 @@ def run_analysis_blocking(
             payload = _run_cot(home_abbr, away_abbr, home_name, away_name, game_description, llm_fn)
     writer.flush()
     raw = payload.get("raw", "")
+    report = parse_report(raw)
+    report = _safe_enrich(report, home_abbr, away_abbr, home_name, away_name)
     return {
-        "report": parse_report(raw),
+        "report": report,
         "raw": payload.get("result", {}),
         "trace": writer.captured(),
     }

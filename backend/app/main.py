@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import analysis, backtest, games, meta
+from app.routers import analysis, backtest, games, meta, pipelines
 
 
 def create_app() -> FastAPI:
@@ -32,6 +32,7 @@ def create_app() -> FastAPI:
     app.include_router(games.router)
     app.include_router(analysis.router)
     app.include_router(backtest.router)
+    app.include_router(pipelines.router)
 
     @app.get("/")
     def root() -> dict:

@@ -3,6 +3,7 @@ import Layout from "./components/Layout";
 import MatchupPage from "./pages/MatchupPage";
 import ResearchPage from "./pages/ResearchPage";
 import SimulationPage from "./pages/SimulationPage";
+import PipelinesPage from "./pages/PipelinesPage";
 
 export default function App() {
   return (
@@ -11,6 +12,7 @@ export default function App() {
         <Route path="/" element={<MatchupPage />} />
         <Route path="/research" element={<ResearchPage />} />
         <Route path="/simulation" element={<SimulationPage />} />
+        <Route path="/data" element={<PipelinesPage />} />
         <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>

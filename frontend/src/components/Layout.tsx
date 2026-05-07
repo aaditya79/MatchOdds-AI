@@ -1,6 +1,6 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Activity, BarChart3, Coins, Cpu, Wifi, WifiOff } from "lucide-react";
+import { Activity, BarChart3, Coins, Cpu, Database, Wifi, WifiOff } from "lucide-react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { to: "/", label: "Matchup", icon: Activity, exact: true },
   { to: "/research", label: "Research", icon: BarChart3 },
   { to: "/simulation", label: "ROI Sim", icon: Coins },
+  { to: "/data", label: "Data", icon: Database },
 ];
 
 export default function Layout() {
