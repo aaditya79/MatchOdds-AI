@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bar,
   BarChart,
@@ -17,11 +17,13 @@ import {
   YAxis,
   ZAxis,
 } from "recharts";
-import { Loader2, Play } from "lucide-react";
+import { CheckCircle2, ChevronDown, Loader2, Play, Terminal, XCircle } from "lucide-react";
 import { api } from "@/lib/api";
 import { Panel } from "@/components/Panel";
 import { StatChip } from "@/components/StatChip";
-import { formatNumber, methodDisplayName } from "@/lib/utils";
+import { ChartTooltip } from "@/components/ChartTooltip";
+import { cn, formatNumber, methodDisplayName } from "@/lib/utils";
+import { useBacktestJob } from "@/hooks/useBacktestJob";
 import type { BacktestSummaryRow, CalibrationRow, PredictionRow } from "@/types";
 
 const NUMERIC_METRICS = [
@@ -62,16 +64,16 @@ export default function ResearchPage() {
   const [season, setSeason] = useState("2025-26");
   const [minHist, setMinHist] = useState(10);
 
-  const runMut = useMutation({
-    mutationFn: () =>
-      api.backtestRun({ n_games: nGames, season, min_history: minHist }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["bt-summary"] });
-      qc.invalidateQueries({ queryKey: ["bt-preds"] });
-      qc.invalidateQueries({ queryKey: ["bt-cal"] });
-      qc.invalidateQueries({ queryKey: ["bt-ablations"] });
-    },
+  const job = useBacktestJob(() => {
+    qc.invalidateQueries({ queryKey: ["bt-summary"] });
+    qc.invalidateQueries({ queryKey: ["bt-preds"] });
+    qc.invalidateQueries({ queryKey: ["bt-cal"] });
+    qc.invalidateQueries({ queryKey: ["bt-ablations"] });
   });
+
+  const runBacktest = () => {
+    job.start({ n_games: nGames, season, min_history: minHist });
+  };
 
   const availableMetrics = useMemo(
     () => NUMERIC_METRICS.filter((m) => summaryRows.some((r) => typeof (r as any)[m] === "number")),
@@ -126,33 +128,33 @@ export default function ResearchPage() {
             <button
               type="button"
               className="btn-primary w-full"
-              onClick={() => runMut.mutate()}
-              disabled={runMut.isPending}
+              onClick={runBacktest}
+              disabled={job.status === "running"}
             >
-              {runMut.isPending ? (
+              {job.status === "running" ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : (
                 <Play className="h-4 w-4" />
               )}
-              Run / Refresh Backtest
+              {job.status === "running" ? "Running…" : "Run / Refresh Backtest"}
             </button>
           </div>
         </div>
 
-        {runMut.isError && (
-          <p className="mt-3 text-xs text-loss">
-            Backtest failed: {(runMut.error as Error).message}
-          </p>
-        )}
-        {runMut.data && (
-          <details className="mt-3 rounded-lg border border-white/[0.06] bg-bg-panel2/60 p-3 text-xs text-slate-400">
-            <summary className="cursor-pointer text-slate-300">View backtest output</summary>
-            <pre className="mt-2 max-h-64 overflow-y-auto whitespace-pre-wrap font-mono text-[11px] text-slate-400">
-              {runMut.data.output.slice(-4000)}
-            </pre>
-          </details>
+        {job.error && (
+          <p className="mt-3 text-xs text-loss">{job.error}</p>
         )}
       </Panel>
+
+      {(job.status === "running" || job.output.length > 0) && (
+        <BacktestLogPane
+          status={job.status}
+          output={job.output}
+          startedAt={job.startedAt}
+          finishedAt={job.finishedAt}
+          exitCode={job.exitCode}
+        />
+      )}
 
       {meta && Object.keys(meta).length > 0 && <RunHealth meta={meta} />}
 
@@ -251,8 +253,14 @@ export default function ResearchPage() {
                 <XAxis dataKey="method" stroke="rgba(255,255,255,0.5)" />
                 <YAxis stroke="rgba(255,255,255,0.5)" />
                 <Tooltip
-                  contentStyle={tooltipStyle}
-                  formatter={(v: number) => fmt(v, chartMetric)}
+                  cursor={{ fill: "rgba(255,255,255,0.04)" }}
+                  content={
+                    <ChartTooltip
+                      valueFormatter={(v: any) =>
+                        typeof v === "number" ? fmt(v, chartMetric) : String(v)
+                      }
+                    />
+                  }
                 />
                 <Bar dataKey="value" radius={[6, 6, 0, 0]}>
                   {summaryRows.map((r, i) => (
@@ -286,8 +294,19 @@ export default function ResearchPage() {
                     tickFormatter={(v) => `${Math.round(v * 100)}%`}
                   />
                   <Tooltip
-                    contentStyle={tooltipStyle}
-                    formatter={(v: number) => `${(v * 100).toFixed(1)}%`}
+                    cursor={{ stroke: "rgba(255,255,255,0.18)", strokeDasharray: "3 3" }}
+                    content={
+                      <ChartTooltip
+                        labelFormatter={(v: any) =>
+                          typeof v === "number"
+                            ? `Predicted home win prob: ${Math.round(v * 100)}%`
+                            : String(v)
+                        }
+                        valueFormatter={(v: any) =>
+                          typeof v === "number" ? `${(v * 100).toFixed(1)}%` : String(v)
+                        }
+                      />
+                    }
                   />
                   <Legend />
                   <ReferenceLine
@@ -337,8 +356,17 @@ export default function ResearchPage() {
                   <XAxis dataKey="source" stroke="rgba(255,255,255,0.5)" />
                   <YAxis stroke="rgba(255,255,255,0.5)" />
                   <Tooltip
-                    contentStyle={tooltipStyle}
-                    formatter={(v: number) => v.toFixed(4)}
+                    cursor={{ fill: "rgba(255,255,255,0.04)" }}
+                    content={
+                      <ChartTooltip
+                        labelFormatter={(v: any) => `Removed source: ${v}`}
+                        valueFormatter={(v: any, name?: string) => {
+                          if (typeof v !== "number") return [String(v), name ?? "Δ Brier"];
+                          const sign = v >= 0 ? "+" : "";
+                          return [`${sign}${v.toFixed(4)}`, "Δ Brier vs baseline"];
+                        }}
+                      />
+                    }
                   />
                   <ReferenceLine y={0} stroke="rgba(255,255,255,0.3)" strokeDasharray="3 3" />
                   <Bar dataKey="brier_delta" radius={[6, 6, 0, 0]}>
@@ -519,48 +547,206 @@ function PredictionTable({ rows }: { rows: PredictionRow[] }) {
 
 function InfoDensity({ rows }: { rows: PredictionRow[] }) {
   const cols: { key: keyof PredictionRow; label: string }[] = [
-    { key: "info_density_context_tokens", label: "Context Tokens" },
-    { key: "info_density_vector_hits", label: "Vector Hits" },
+    { key: "info_density_context_tokens", label: "Context Tokens (total input size)" },
+    { key: "info_density_vector_hits", label: "Vector Store Hits" },
     { key: "info_density_news_articles", label: "News Articles" },
     { key: "info_density_youtube_comments", label: "YouTube Comments" },
   ];
-  const available = cols.filter((c) => rows.some((r) => typeof r[c.key] === "number"));
+  const available = useMemo(
+    () => cols.filter((c) => rows.some((r) => typeof r[c.key] === "number")),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [rows],
+  );
+
+  const [pick, setPick] = useState<keyof PredictionRow | null>(null);
+  useEffect(() => {
+    if (available.length > 0 && (pick === null || !available.some((c) => c.key === pick))) {
+      setPick(available[0].key);
+    }
+  }, [available, pick]);
+
   if (available.length === 0 || !rows.some((r) => typeof r.brier_score === "number")) {
     return null;
   }
-  const [pick, setPick] = [available[0].key as keyof PredictionRow, () => {}];
-  const data = rows
-    .filter(
-      (r) =>
-        typeof r[pick] === "number" &&
-        typeof r.brier_score === "number" &&
-        !Number.isNaN(r.brier_score),
-    )
-    .map((r) => ({ x: r[pick] as number, y: r.brier_score!, method: r.method }));
+  const activePick = (pick ?? available[0].key) as keyof PredictionRow;
+  const activeLabel = available.find((c) => c.key === activePick)?.label ?? String(activePick);
+
+  const data = useMemo(
+    () =>
+      rows
+        .filter(
+          (r) =>
+            typeof r[activePick] === "number" &&
+            typeof r.brier_score === "number" &&
+            !Number.isNaN(r.brier_score),
+        )
+        .map((r) => ({
+          x: Number(r[activePick]),
+          y: Number(r.brier_score),
+          method: r.method,
+        })),
+    [rows, activePick],
+  );
+
+  // Continuous axis bounds with a tiny padding so points don't touch edges.
+  const xMin = data.length ? Math.min(...data.map((d) => d.x)) : 0;
+  const xMax = data.length ? Math.max(...data.map((d) => d.x)) : 1;
+  const xPad = (xMax - xMin) * 0.04 || 1;
+  const yMin = data.length ? Math.min(...data.map((d) => d.y)) : 0;
+  const yMax = data.length ? Math.max(...data.map((d) => d.y)) : 1;
+  const yPad = (yMax - yMin) * 0.08 || 0.05;
+
+  // Pearson correlation — same as the Streamlit version's annotation.
+  const pearson = useMemo(() => {
+    const n = data.length;
+    if (n < 3) return null;
+    const mx = data.reduce((s, d) => s + d.x, 0) / n;
+    const my = data.reduce((s, d) => s + d.y, 0) / n;
+    let num = 0;
+    let dx2 = 0;
+    let dy2 = 0;
+    for (const d of data) {
+      const ex = d.x - mx;
+      const ey = d.y - my;
+      num += ex * ey;
+      dx2 += ex * ex;
+      dy2 += ey * ey;
+    }
+    const denom = Math.sqrt(dx2 * dy2);
+    if (denom === 0) return null;
+    return num / denom;
+  }, [data]);
+
+  // High vs low-info quartile bands (mirrors Streamlit's q25/q75 split).
+  const sortedX = [...data].map((d) => d.x).sort((a, b) => a - b);
+  const q = (p: number) => {
+    if (sortedX.length === 0) return null;
+    const idx = Math.max(0, Math.min(sortedX.length - 1, Math.floor((sortedX.length - 1) * p)));
+    return sortedX[idx];
+  };
+  const q25 = q(0.25);
+  const q75 = q(0.75);
+  const loBrier =
+    q25 != null
+      ? data.filter((d) => d.x <= q25).reduce((s, d, _i, arr) => s + d.y / arr.length, 0)
+      : null;
+  const hiBrier =
+    q75 != null
+      ? data.filter((d) => d.x >= q75).reduce((s, d, _i, arr) => s + d.y / arr.length, 0)
+      : null;
+  const delta = loBrier != null && hiBrier != null ? hiBrier - loBrier : null;
+
+  // Compact axis tick formatter — token counts can hit 80k+.
+  const fmtAxis = (v: number) =>
+    Math.abs(v) >= 1000 ? `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}k` : `${v.toFixed(0)}`;
 
   return (
     <Panel
       title="Information Density vs Prediction Quality (RQ1)"
-      subtitle="Lower Brier = better. Negative correlation = more info → better predictions."
+      subtitle="Each point is one game-method prediction. Lower Brier = better. Negative correlation → more info improves predictions."
+      action={
+        <select
+          className="input max-w-[18rem]"
+          value={activePick as string}
+          onChange={(e) => setPick(e.target.value as keyof PredictionRow)}
+        >
+          {available.map((c) => (
+            <option key={c.key as string} value={c.key as string}>
+              {c.label}
+            </option>
+          ))}
+        </select>
+      }
     >
-      <ResponsiveContainer width="100%" height={340}>
-        <ScatterChart>
-          <CartesianGrid stroke="rgba(255,255,255,0.05)" />
-          <XAxis dataKey="x" stroke="rgba(255,255,255,0.5)" name={available[0].label} />
-          <YAxis dataKey="y" stroke="rgba(255,255,255,0.5)" name="Brier" />
-          <ZAxis range={[60, 60]} />
-          <Tooltip contentStyle={tooltipStyle} cursor={{ stroke: "rgba(255,255,255,0.15)" }} />
+      <ResponsiveContainer width="100%" height={360}>
+        <ScatterChart margin={{ top: 16, right: 24, bottom: 28, left: 12 }}>
+          <CartesianGrid stroke="rgba(255,255,255,0.06)" />
+          <XAxis
+            type="number"
+            dataKey="x"
+            domain={[xMin - xPad, xMax + xPad]}
+            stroke="rgba(255,255,255,0.5)"
+            tickFormatter={fmtAxis}
+            label={{
+              value: activeLabel,
+              position: "insideBottom",
+              offset: -12,
+              fill: "rgba(255,255,255,0.55)",
+              fontSize: 12,
+            }}
+          />
+          <YAxis
+            type="number"
+            dataKey="y"
+            domain={[Math.max(0, yMin - yPad), yMax + yPad]}
+            stroke="rgba(255,255,255,0.5)"
+            tickFormatter={(v) => v.toFixed(2)}
+            label={{
+              value: "Brier (lower is better)",
+              angle: -90,
+              position: "insideLeft",
+              offset: 8,
+              fill: "rgba(255,255,255,0.55)",
+              fontSize: 12,
+            }}
+          />
+          <ZAxis range={[64, 64]} />
+          <Tooltip
+            cursor={{ stroke: "rgba(255,255,255,0.18)", strokeDasharray: "3 3" }}
+            content={
+              <ChartTooltip
+                sublabel={(payload: any[]) => {
+                  const m = payload?.[0]?.payload?.method;
+                  return m ? methodDisplayName(m) : null;
+                }}
+                valueFormatter={(value: any, name?: string) => {
+                  if (typeof value !== "number") return [String(value), name ?? ""];
+                  if (name === "x") return [fmtAxis(value), activeLabel];
+                  if (name === "y") return [value.toFixed(4), "Brier"];
+                  return [String(value), name ?? ""];
+                }}
+              />
+            }
+          />
+          <Legend wrapperStyle={{ paddingTop: 12 }} />
           {Object.keys(COLORS).map((m) => (
             <Scatter
               key={m}
               name={methodDisplayName(m)}
               data={data.filter((d) => d.method === m)}
               fill={COLORS[m]}
+              fillOpacity={0.75}
+              stroke={COLORS[m]}
+              strokeWidth={1.2}
             />
           ))}
-          <Legend />
         </ScatterChart>
       </ResponsiveContainer>
+
+      <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-4">
+        <StatChip
+          label="Pearson r"
+          value={pearson == null ? "—" : pearson.toFixed(3)}
+          hint={pearson == null ? "Need ≥ 3 points" : pearson < 0 ? "More info → better" : "More info → worse"}
+          tone={pearson == null ? "default" : pearson < 0 ? "win" : "loss"}
+        />
+        <StatChip
+          label="Low-info Brier"
+          value={loBrier == null ? "—" : loBrier.toFixed(4)}
+          hint="≤25th percentile"
+        />
+        <StatChip
+          label="High-info Brier"
+          value={hiBrier == null ? "—" : hiBrier.toFixed(4)}
+          hint="≥75th percentile"
+        />
+        <StatChip
+          label="Δ (high − low)"
+          value={delta == null ? "—" : `${delta >= 0 ? "+" : ""}${delta.toFixed(4)}`}
+          hint={delta == null ? "—" : delta > 0 ? "High-info games harder" : "High-info games easier"}
+          tone={delta == null ? "default" : delta > 0 ? "loss" : "win"}
+        />
+      </div>
     </Panel>
   );
 }
@@ -586,10 +772,140 @@ function fmt(v: number | undefined, m: string) {
   return formatNumber(v, 4);
 }
 
-const tooltipStyle = {
-  background: "#0d1424",
-  border: "1px solid rgba(255,255,255,0.08)",
-  borderRadius: "10px",
-  fontSize: "12px",
-  color: "#e2e8f0",
-};
+
+
+function BacktestLogPane({
+  status,
+  output,
+  startedAt,
+  finishedAt,
+  exitCode,
+}: {
+  status: "idle" | "running" | "done" | "error" | "timeout";
+  output: string[];
+  startedAt: number | null;
+  finishedAt: number | null;
+  exitCode: number | null;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll while live.
+  useEffect(() => {
+    if (status === "running" && ref.current) {
+      ref.current.scrollTop = ref.current.scrollHeight;
+    }
+  }, [output.length, status]);
+
+  const duration =
+    startedAt != null
+      ? Math.max(0, Math.round(((finishedAt ?? Date.now() / 1000) - startedAt)))
+      : null;
+
+  const Icon = status === "running" ? Loader2 : status === "done" ? CheckCircle2 : XCircle;
+  const tone =
+    status === "running"
+      ? "border-accent/30 bg-accent/5 text-accent"
+      : status === "done"
+      ? "border-win/30 bg-win/5 text-win"
+      : "border-loss/30 bg-loss/5 text-loss";
+
+  return (
+    <div className={cn("rounded-2xl border p-5 shadow-card", tone)}>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Terminal className="h-4 w-4" />
+          <span className="font-display text-sm font-semibold">
+            Backtest log
+          </span>
+          <span
+            className={cn(
+              "rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider",
+              status === "running"
+                ? "border-accent/40 bg-accent/15 text-accent"
+                : status === "done"
+                ? "border-win/30 bg-win/10 text-win"
+                : status === "idle"
+                ? "border-white/10 bg-white/[0.04] text-slate-400"
+                : "border-loss/30 bg-loss/10 text-loss",
+            )}
+          >
+            <Icon
+              className={cn(
+                "mr-1 inline h-3 w-3",
+                status === "running" && "animate-spin",
+              )}
+            />
+            {status === "running"
+              ? "Running"
+              : status === "done"
+              ? "Done"
+              : status === "error"
+              ? "Error"
+              : status === "timeout"
+              ? "Timed out"
+              : "Idle"}
+          </span>
+          {duration != null && (
+            <span className="text-xs text-slate-500">{duration}s</span>
+          )}
+          {exitCode != null && exitCode !== 0 && (
+            <span className="text-xs text-loss">exit {exitCode}</span>
+          )}
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-200"
+        >
+          <ChevronDown
+            className={cn(
+              "h-3.5 w-3.5 transition-transform",
+              expanded ? "rotate-0" : "-rotate-90",
+            )}
+          />
+          {expanded ? "Hide" : "Show"} ({output.length} lines)
+        </button>
+      </div>
+
+      <p className="mt-1 text-xs text-slate-500">
+        Output streams from <span className="font-mono text-slate-400">nba_backtest.py</span>{" "}
+        in real time. Identical lines are mirrored to the FastAPI server's terminal.
+        Per-game caching under <span className="font-mono text-slate-400">data/backtest_cache/</span>{" "}
+        keeps repeats cheap.
+      </p>
+
+      {expanded && (
+        <div
+          ref={ref}
+          className="scroll-thin mt-3 max-h-96 overflow-y-auto rounded-xl border border-white/[0.06] bg-bg/60 p-4 font-mono text-[11px] leading-relaxed"
+        >
+          {output.length === 0 ? (
+            <span className="text-slate-500">Waiting for output…</span>
+          ) : (
+            output.map((line, i) => (
+              <div
+                key={i}
+                className={cn(
+                  "whitespace-pre-wrap break-words",
+                  line.startsWith("[runner")
+                    ? "text-loss"
+                    : line.startsWith("$ ")
+                    ? "text-accent"
+                    : line.includes("ERROR") || line.includes("Error")
+                    ? "text-loss"
+                    : line.startsWith("===")
+                    ? "text-court-glow"
+                    : "text-slate-300",
+                )}
+              >
+                {line}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

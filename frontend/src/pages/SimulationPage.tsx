@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Bar,
@@ -14,10 +15,13 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { AlertTriangle, ArrowRight, Database, Info, RotateCcw } from "lucide-react";
 import { api } from "@/lib/api";
 import { Panel } from "@/components/Panel";
 import { StatChip } from "@/components/StatChip";
+import { ChartTooltip } from "@/components/ChartTooltip";
 import { methodDisplayName } from "@/lib/utils";
+import type { RoiResponse } from "@/types";
 
 const COLORS: Record<string, string> = {
   multi_agent_debate: "#ff8c61",
@@ -95,22 +99,15 @@ export default function SimulationPage() {
         </div>
       </Panel>
 
-      {!available && (
-        <Panel>
-          <p className="text-sm text-slate-400">
-            This backtest file does not include market implied probabilities. Re-run the
-            backtest pipeline so the simulator has consensus odds to compare against.
-          </p>
-        </Panel>
-      )}
-
-      {available && summary.length === 0 && (
-        <Panel>
-          <p className="text-sm text-slate-400">
-            No qualifying simulated bets under the current filters. Lower the edge threshold
-            or relax the side filter.
-          </p>
-        </Panel>
+      {sim.data && (sim.data.summary?.length ?? 0) === 0 && (
+        <DiagnosticPanel
+          response={sim.data}
+          onRelax={() => {
+            setEdge(0);
+            setMinConfidence(0.5);
+            setSide("Both");
+          }}
+        />
       )}
 
       {available && summary.length > 0 && (
@@ -208,7 +205,19 @@ export default function SimulationPage() {
                 <XAxis dataKey="method" stroke="rgba(255,255,255,0.5)" />
                 <YAxis stroke="rgba(255,255,255,0.5)" tickFormatter={(v) => `${(v * 100).toFixed(0)}%`} />
                 <ReferenceLine y={0} stroke="rgba(255,255,255,0.3)" strokeDasharray="3 3" />
-                <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => `${(v * 100).toFixed(2)}%`} />
+                <Tooltip
+                  cursor={{ fill: "rgba(255,255,255,0.04)" }}
+                  content={
+                    <ChartTooltip
+                      labelFormatter={(v: any) => `Method: ${v}`}
+                      valueFormatter={(v: any) => {
+                        if (typeof v !== "number") return [String(v), "ROI"];
+                        const sign = v >= 0 ? "+" : "";
+                        return [`${sign}${(v * 100).toFixed(2)}%`, "ROI"];
+                      }}
+                    />
+                  }
+                />
                 <Bar dataKey="roi" radius={[6, 6, 0, 0]}>
                   {summary.map((r, i) => (
                     <Cell key={i} fill={r.roi >= 0 ? "#00d4a4" : "#ff5470"} />
@@ -228,7 +237,19 @@ export default function SimulationPage() {
                   <CartesianGrid stroke="rgba(255,255,255,0.05)" />
                   <XAxis dataKey="date" stroke="rgba(255,255,255,0.5)" />
                   <YAxis stroke="rgba(255,255,255,0.5)" />
-                  <Tooltip contentStyle={tooltipStyle} />
+                  <Tooltip
+                    cursor={{ stroke: "rgba(255,255,255,0.18)", strokeDasharray: "3 3" }}
+                    content={
+                      <ChartTooltip
+                        labelFormatter={(v: any) => `Date: ${v}`}
+                        valueFormatter={(v: any, name?: string) => {
+                          if (typeof v !== "number") return [String(v), name ?? "Units"];
+                          const sign = v >= 0 ? "+" : "";
+                          return [`${sign}${v.toFixed(2)} u`, name ?? "Units"];
+                        }}
+                      />
+                    }
+                  />
                   <Legend />
                   {Object.keys(COLORS).map((m) => {
                     const data = bets
@@ -315,6 +336,121 @@ export default function SimulationPage() {
   );
 }
 
+function DiagnosticPanel({
+  response,
+  onRelax,
+}: {
+  response: RoiResponse;
+  onRelax: () => void;
+}) {
+  const reason = response.reason ?? (response.available ? "no_qualifying_bets" : "predictions_missing");
+  const message = response.message ?? "";
+  const diag = response.diagnostics ?? {};
+
+  // Three classes of failure get different visual treatment + actions.
+  const isDataIssue =
+    reason === "predictions_missing" ||
+    reason === "predictions_empty" ||
+    reason === "market_columns_missing" ||
+    reason === "market_data_missing";
+
+  const isFilterIssue =
+    reason === "no_qualifying_bets" || reason === "no_rows_after_method_filter";
+
+  return (
+    <Panel
+      title={
+        <span className="flex items-center gap-2">
+          <AlertTriangle
+            className={`h-4 w-4 ${isDataIssue ? "text-warn" : "text-court-glow"}`}
+          />
+          {isDataIssue ? "Setup needed" : "No qualifying bets"}
+        </span>
+      }
+    >
+      <p className="text-sm leading-relaxed text-slate-300">{message}</p>
+
+      {Object.keys(diag).length > 0 && (
+        <details className="mt-3 rounded-lg border border-white/[0.06] bg-bg-panel2/40 p-3 text-xs">
+          <summary className="cursor-pointer text-slate-400">Diagnostics</summary>
+          <ul className="mt-2 space-y-0.5 font-mono text-[11px] text-slate-500">
+            {Object.entries(diag).map(([k, v]) => (
+              <li key={k}>
+                <span className="text-slate-400">{k}:</span> {String(v)}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      {reason === "market_data_missing" && (
+        <div className="mt-4 grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
+          <div className="rounded-lg border border-warn/20 bg-warn/5 p-3">
+            <div className="font-semibold uppercase tracking-wider text-warn">
+              Step 1 · manual download
+            </div>
+            <p className="mt-1 text-slate-300">
+              Save{" "}
+              <span className="font-mono text-slate-100">data/kaggle_odds.csv</span> from{" "}
+              <a
+                href="https://www.kaggle.com/datasets/erichqiu/nba-odds-and-scores"
+                target="_blank"
+                rel="noreferrer"
+                className="underline decoration-dotted underline-offset-2 hover:text-accent-glow"
+              >
+                kaggle.com/datasets/erichqiu/nba-odds-and-scores
+              </a>
+              .
+            </p>
+          </div>
+          <div className="rounded-lg border border-court/20 bg-court/5 p-3">
+            <div className="font-semibold uppercase tracking-wider text-court-glow">
+              Step 2 · re-run pipelines
+            </div>
+            <p className="mt-1 text-slate-300">
+              Run the <strong>Odds</strong> pipeline (writes{" "}
+              <span className="font-mono">odds_historical.csv</span>), then run a fresh{" "}
+              <strong>Backtest</strong>.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        {(reason === "predictions_missing" ||
+          reason === "predictions_empty" ||
+          reason === "market_columns_missing") && (
+          <Link to="/research" className="btn-primary">
+            <ArrowRight className="h-4 w-4" />
+            Open Research page
+          </Link>
+        )}
+        {reason === "market_data_missing" && (
+          <Link to="/data" className="btn-primary">
+            <Database className="h-4 w-4" />
+            Open Data pipelines
+          </Link>
+        )}
+        {isFilterIssue && (
+          <button type="button" className="btn-primary" onClick={onRelax}>
+            <RotateCcw className="h-4 w-4" />
+            Relax filters
+          </button>
+        )}
+        <a
+          href="/docs#/backtest"
+          target="_blank"
+          rel="noreferrer"
+          className="btn-ghost"
+        >
+          <Info className="h-4 w-4" />
+          API docs
+        </a>
+      </div>
+    </Panel>
+  );
+}
+
 function Hero() {
   return (
     <div className="relative overflow-hidden rounded-3xl border border-white/[0.06] bg-bg-panel/60 p-7">
@@ -346,10 +482,3 @@ function bestBy<T extends Record<string, any>>(rows: T[], key: keyof T, higherBe
   )[0];
 }
 
-const tooltipStyle = {
-  background: "#0d1424",
-  border: "1px solid rgba(255,255,255,0.08)",
-  borderRadius: "10px",
-  fontSize: "12px",
-  color: "#e2e8f0",
-};

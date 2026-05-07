@@ -206,6 +206,16 @@ export interface RoiResponse {
   available: boolean;
   summary: RoiSummaryRow[];
   bets: RoiBet[];
+  reason?:
+    | "ok"
+    | "predictions_missing"
+    | "predictions_empty"
+    | "market_columns_missing"
+    | "market_data_missing"
+    | "no_rows_after_method_filter"
+    | "no_qualifying_bets";
+  message?: string;
+  diagnostics?: Record<string, unknown>;
 }
 
 export type PipelineName = "data" | "injuries" | "odds" | "news" | "vector_store";
@@ -233,4 +243,20 @@ export interface PipelineStartResponse {
   rate_limited?: boolean;
   cooldown_remaining?: number;
   status?: PipelineStatus;
+}
+
+export interface BacktestJobStatus {
+  status: "idle" | "running" | "done" | "error" | "timeout";
+  params: { n_games: number; season: string; min_history: number } | null;
+  started_at: number | null;
+  finished_at: number | null;
+  duration_seconds: number | null;
+  exit_code: number | null;
+  output_tail: string[];
+}
+
+export interface BacktestStartResponse {
+  ok: boolean;
+  error?: string;
+  status: BacktestJobStatus;
 }

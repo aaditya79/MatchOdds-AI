@@ -1,4 +1,4 @@
-"""Backtest CSV loaders + ROI simulator.
+"""Backtest CSV loaders + ROI simulator + async job runner.
 
 Reads the artifacts produced by ``nba_backtest.py``:
     data/backtest_summary.csv
@@ -7,7 +7,15 @@ Reads the artifacts produced by ``nba_backtest.py``:
     data/backtest_run_metadata.json
     data/backtest_ablation_*_summary.csv
 
-Also runs ``nba_backtest.py`` as a subprocess on demand from the API.
+Also runs ``nba_backtest.py`` as a subprocess. The runner is non-blocking:
+each stdout line is mirrored to the FastAPI process's terminal AND fanned
+out to subscribers (used by the SSE stream + the polling status endpoint).
+
+Caching: the script itself memoises per-(game, method) under
+``data/backtest_cache/``, so re-running with the same parameters skips
+games that already have cached predictions. The job runner is also
+single-flight — concurrent ``POST /api/backtest/run`` calls return the
+running job instead of starting a duplicate.
 """
 
 from __future__ import annotations
@@ -15,9 +23,15 @@ from __future__ import annotations
 import glob
 import json
 import math
+import os
+import queue
 import subprocess
 import sys
+import threading
+import time
+from collections import deque
 from pathlib import Path
+from typing import Generator, Optional
 
 import numpy as np
 import pandas as pd
@@ -135,17 +149,75 @@ def simulate_roi(
     side_filter: str = "Both",
     min_confidence: float = 0.50,
 ) -> dict:
+    """Run a flat-stake simulation against backtest predictions.
+
+    Returns a dict with ``available``, ``reason`` (machine-readable code),
+    ``message`` (human guidance), ``diagnostics`` (counts the UI uses to
+    point at the right fix), plus the usual ``summary`` and ``bets`` rows.
+    """
+
+    def _empty(reason: str, message: str, diagnostics: Optional[dict] = None) -> dict:
+        return {
+            "summary": [],
+            "bets": [],
+            "available": False,
+            "reason": reason,
+            "message": message,
+            "diagnostics": diagnostics or {},
+        }
+
     if not PRED_PATH.exists():
-        return {"summary": [], "bets": [], "available": False}
+        return _empty(
+            "predictions_missing",
+            "No backtest predictions on disk yet. Open the Research page and run a backtest first.",
+        )
 
     df = pd.read_csv(PRED_PATH)
-    if df.empty or "market_home_implied_prob" not in df.columns or "market_away_implied_prob" not in df.columns:
-        return {"summary": [], "bets": [], "available": False}
+    if df.empty:
+        return _empty(
+            "predictions_empty",
+            "data/backtest_predictions.csv exists but is empty. Re-run the backtest.",
+        )
+
+    has_market_cols = (
+        "market_home_implied_prob" in df.columns
+        and "market_away_implied_prob" in df.columns
+    )
+    if not has_market_cols:
+        return _empty(
+            "market_columns_missing",
+            "Backtest predictions don't include market columns yet. "
+            "Re-run the backtest after pulling the latest nba_backtest.py.",
+            {"row_count": int(len(df))},
+        )
+
+    market_rows = (
+        df["market_home_implied_prob"].notna() & df["market_away_implied_prob"].notna()
+    ).sum()
+    if market_rows == 0:
+        return _empty(
+            "market_data_missing",
+            "Predictions have market columns but every row is null. "
+            "data/odds_historical.csv was not produced when nba_backtest.py ran. "
+            "To populate it: download the Kaggle dataset "
+            "(kaggle.com/datasets/erichqiu/nba-odds-and-scores) to "
+            "data/kaggle_odds.csv, run the Odds pipeline, then re-run the backtest.",
+            {
+                "row_count": int(len(df)),
+                "rows_with_market_data": 0,
+                "missing_file": "data/odds_historical.csv",
+                "manual_step": "data/kaggle_odds.csv",
+            },
+        )
 
     if method != "All":
         df = df[df["method"] == method].copy()
     if df.empty:
-        return {"summary": [], "bets": [], "available": True}
+        return _empty(
+            "no_rows_after_method_filter",
+            f"No predictions in the file for method = {method}.",
+            {"row_count": 0},
+        )
 
     sim_rows: list[dict] = []
     for _, row in df.iterrows():
@@ -201,7 +273,24 @@ def simulate_roi(
         })
 
     if not sim_rows:
-        return {"summary": [], "bets": [], "available": True}
+        return {
+            "summary": [],
+            "bets": [],
+            "available": True,
+            "reason": "no_qualifying_bets",
+            "message": (
+                "No bets passed the current filters. Try lowering the edge "
+                "threshold, dropping the minimum confidence, or switching to "
+                "'Both' for the side filter."
+            ),
+            "diagnostics": {
+                "rows_evaluated": int(len(df)),
+                "rows_with_market_data": int(market_rows),
+                "edge_threshold": edge_threshold,
+                "min_confidence": min_confidence,
+                "side_filter": side_filter,
+            },
+        }
 
     bets_df = pd.DataFrame(sim_rows)
     bets_df["date"] = pd.to_datetime(bets_df["date"], errors="coerce")
@@ -227,11 +316,227 @@ def simulate_roi(
         "summary": _df_to_records(summary_df),
         "bets": _df_to_records(bets_df),
         "available": True,
+        "reason": "ok",
+        "message": "",
+        "diagnostics": {
+            "rows_evaluated": int(len(df)),
+            "rows_with_market_data": int(market_rows),
+            "qualifying_bets": int(len(sim_rows)),
+        },
     }
 
 
+# ---------------------------------------------------------------------------
+# Async backtest job runner
+# ---------------------------------------------------------------------------
+#
+# Goals:
+#   * Caching — the script's own per-(game, method) cache under
+#     ``data/backtest_cache/`` makes re-runs cheap. We add a single-flight
+#     guard at the API layer so concurrent POSTs reuse the running job.
+#   * Terminal logs — each subprocess line is tee'd to ``sys.stdout`` so
+#     the dev running ``uvicorn`` sees real-time progress in their terminal.
+#   * In-app streaming — every line is also pushed onto a ring buffer (for
+#     the polling endpoint) and fanned out to live SSE subscribers.
+
+# Sentinel values written to the broadcast queue.
+_DONE = object()
+
+
+class _BacktestJob:
+    """Mutable, in-memory state for a single backtest run."""
+
+    def __init__(self) -> None:
+        self.status: str = "idle"  # idle | running | done | error | timeout
+        self.params: Optional[dict] = None
+        self.started_at: Optional[float] = None
+        self.finished_at: Optional[float] = None
+        self.exit_code: Optional[int] = None
+        self.output: deque[str] = deque(maxlen=2000)
+        self._proc: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+        # Live SSE subscribers — one queue per connected client.
+        self._subscribers: list["queue.Queue[object]"] = []
+        self._subscribers_lock = threading.Lock()
+
+    def is_running(self) -> bool:
+        return self.status == "running"
+
+    def to_status(self) -> dict:
+        duration = None
+        if self.started_at is not None:
+            end = self.finished_at if self.finished_at is not None else time.time()
+            duration = int(end - self.started_at)
+        return {
+            "status": self.status,
+            "params": self.params,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_seconds": duration,
+            "exit_code": self.exit_code,
+            "output_tail": list(self.output),
+        }
+
+    def _broadcast(self, item: object) -> None:
+        with self._subscribers_lock:
+            for sub in list(self._subscribers):
+                try:
+                    sub.put_nowait(item)
+                except queue.Full:
+                    pass
+
+    def subscribe(self) -> "queue.Queue[object]":
+        q: "queue.Queue[object]" = queue.Queue(maxsize=1024)
+        with self._subscribers_lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: "queue.Queue[object]") -> None:
+        with self._subscribers_lock:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
+
+
+_JOB = _BacktestJob()
+
+
+def get_job_status() -> dict:
+    return _JOB.to_status()
+
+
+def _run_backtest_subprocess(n_games: int, season: str, min_history: int) -> None:
+    """Drive ``nba_backtest.py`` to completion, tee'ing stdout."""
+    job = _JOB
+    cmd = [
+        sys.executable,
+        "-u",  # unbuffered child output → we get lines as they happen
+        "nba_backtest.py",
+        "--n-games", str(n_games),
+        "--min-games-history", str(min_history),
+    ]
+    if season and season != "All":
+        cmd.extend(["--season", season])
+
+    banner = f"$ {' '.join(cmd)}"
+    job.output.append(banner)
+    job._broadcast(banner)
+    sys.stdout.write(banner + "\n")
+    sys.stdout.flush()
+
+    try:
+        env = os.environ.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+        job._proc = proc
+
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            clean = line.rstrip()
+            if not clean:
+                continue
+            job.output.append(clean)
+            job._broadcast(clean)
+            # Mirror to uvicorn's terminal so devs see live progress.
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+        proc.wait()
+        job.exit_code = proc.returncode
+        job.status = "done" if proc.returncode == 0 else "error"
+    except Exception as exc:  # surface launch / pipe failures
+        msg = f"[runner error] {exc}"
+        job.output.append(msg)
+        job._broadcast(msg)
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+        job.status = "error"
+        job.exit_code = -1
+    finally:
+        job.finished_at = time.time()
+        job._proc = None
+        job._broadcast(_DONE)
+
+
+def start_backtest(n_games: int, season: str, min_history: int) -> dict:
+    """Kick off a backtest in the background. Idempotent: returns the
+    running job if one is already in flight.
+    """
+    job = _JOB
+    with job._lock:
+        if job.is_running():
+            return {
+                "ok": False,
+                "error": "Backtest already running",
+                "status": job.to_status(),
+            }
+        job.status = "running"
+        job.params = {
+            "n_games": int(n_games),
+            "season": season,
+            "min_history": int(min_history),
+        }
+        job.started_at = time.time()
+        job.finished_at = None
+        job.exit_code = None
+        job.output.clear()
+        thread = threading.Thread(
+            target=_run_backtest_subprocess,
+            args=(n_games, season, min_history),
+            daemon=True,
+            name="backtest-runner",
+        )
+        thread.start()
+
+    return {"ok": True, "status": job.to_status()}
+
+
+def stream_lines() -> Generator[dict, None, None]:
+    """Yield SSE events: replay the buffer, then live-stream until done."""
+    job = _JOB
+
+    # Snapshot what's already in the ring buffer so a late-joining client
+    # gets context.
+    yield {"event": "snapshot", "data": json.dumps(job.to_status())}
+
+    sub = job.subscribe()
+    try:
+        # If the job isn't running, we still emitted the snapshot — close out.
+        if not job.is_running():
+            yield {"event": "done", "data": json.dumps(job.to_status())}
+            return
+
+        while True:
+            try:
+                item = sub.get(timeout=300)
+            except queue.Empty:
+                # 5-minute idle without output → assume hang / disconnect.
+                yield {"event": "done", "data": json.dumps(job.to_status())}
+                return
+
+            if item is _DONE:
+                yield {"event": "done", "data": json.dumps(job.to_status())}
+                return
+
+            yield {"event": "line", "data": str(item)}
+    finally:
+        job.unsubscribe(sub)
+
+
+# Back-compat: the previous synchronous helper still exists so any caller
+# that wants a one-shot blocking run can keep using it. Not used by the
+# default API any more.
 def run_backtest(n_games: int, season: str, min_history: int) -> tuple[bool, str]:
-    """Spawn ``nba_backtest.py`` and return (ok, combined_output)."""
+    """Spawn ``nba_backtest.py`` synchronously. Legacy / test helper."""
     cmd = [
         sys.executable,
         "nba_backtest.py",

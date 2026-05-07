@@ -7,6 +7,8 @@ import type {
   AblationRow,
   AnalysisMode,
   AnalysisRunResult,
+  BacktestJobStatus,
+  BacktestStartResponse,
   BacktestSummaryRow,
   CalibrationRow,
   Injury,
@@ -80,7 +82,8 @@ export const api = {
   backtestCalibration: () => get<CalibrationRow[]>("/backtest/calibration"),
   backtestAblations: () => get<AblationRow[]>("/backtest/ablations"),
   backtestRun: (req: { n_games: number; season: string; min_history: number }) =>
-    post<{ ok: boolean; output: string }>("/backtest/run", req),
+    post<BacktestStartResponse>("/backtest/run", req),
+  backtestStatus: () => get<BacktestJobStatus>("/backtest/status"),
   pipelinesStatus: () =>
     get<Record<PipelineName, PipelineStatus>>("/pipelines/status"),
   pipelineStart: (name: PipelineName) =>
@@ -118,6 +121,51 @@ export interface StreamEvent {
   message?: string;
   mode?: AnalysisMode;
   generated_at?: string;
+}
+
+export interface BacktestStreamEvent {
+  event: "snapshot" | "line" | "done";
+  data: string; // JSON for snapshot/done, raw line for line
+}
+
+export async function streamBacktest(
+  onEvent: (evt: BacktestStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(BASE + "/backtest/stream", {
+    method: "GET",
+    signal,
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(`Backtest stream failed: ${response.status}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let idx;
+    while ((idx = buffer.indexOf("\n\n")) >= 0) {
+      const chunk = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      const dataLines = chunk
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).trimStart());
+      if (dataLines.length === 0) continue;
+      try {
+        const evt = JSON.parse(dataLines.join("\n")) as BacktestStreamEvent;
+        onEvent(evt);
+        if (evt.event === "done") return;
+      } catch {
+        // ignore malformed events
+      }
+    }
+  }
 }
 
 export async function streamAnalysis(
