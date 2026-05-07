@@ -2,7 +2,53 @@
 
 > **⚠️ Git rules:** Always `git pull` before pushing. **Never `git push --force` to main.** Main was wiped earlier today by an accidental force-push and we had to manually restore. If your local main looks divergent, ask before reconciling.
 
-Updated: 2026-05-03
+Updated: 2026-05-07
+
+---
+
+## 🟢 LATEST STATUS (May 7, 2026) — Aaditya's lane COMPLETE
+
+### What Aaditya finished (all merged to main)
+
+| Item | Result |
+|---|---|
+| 150-game backtest (all 3 methods, Haiku 4.5) | ✅ 132 games completed (18 skipped — early season, <10 prior games) |
+| 7 ablation sweeps (CoT-only) | ✅ All 7 done |
+| RESULTS.md Section 5 | ✅ All sections filled with real numbers |
+| report.tex + report.pdf | ✅ 11-page two-column paper, publication-quality figures |
+| Secondary breakdown (B2B) | ✅ Added — CoT stable, agents degrade on B2B |
+| Streamlit UI improvements | ✅ Market divergence, similar games, info density scatter, ablation chart |
+| Research Evaluation page | ✅ Info density plot + ablation bar chart added |
+| `nba_backtest.py` | ✅ `--methods` flag, `load_dotenv()`, B2B analysis |
+| `nba_agent.py` | ✅ `load_dotenv()` |
+| Duplicate `nba_streamlit_app.py` | ✅ Deleted — `Matchup_Analysis.py` is canonical |
+| Sample data | ✅ `data/sample/` has example CSVs for reproducibility |
+
+### Key eval results (headline numbers for presentation/report)
+
+| Method | Brier | Accuracy | ECE |
+|---|---|---|---|
+| **CoT (winner)** | **0.228** | **61.4%** | **0.068** |
+| Multi-agent debate | 0.283 | 52.3% | 0.167 |
+| Single agent | 0.297 | 52.8% | 0.205 |
+| Random baseline | 0.250 | — | — |
+
+**Ablation top findings:** H2H is most impactful source (Brier delta +0.010 when disabled), followed by stats (+0.007) and vector_store (+0.006). Sources without historical snapshots show near-zero deltas.
+
+**Cost:** $26.09 total, 8,356 API calls, ~$0.20/game across all 3 methods.
+
+### What is NOT done (Tanish + team)
+
+| Item | Owner | Notes |
+|---|---|---|
+| **Streamlit Cloud deployment** | Tanish | share.streamlit.io → connect repo → `Matchup_Analysis.py` → paste API keys in Secrets. Takes 10 min. Critical for demo grade. |
+| React + FastAPI UI merge | Tanish | Branch `claude/inspiring-curie-905ab0` has a complete React frontend + FastAPI backend. Zero conflicts with current main. See branch README for setup. |
+| Manual report-quality scoring | All 3 | Scores already filled in `data/report_quality_scoring.md` — review and adjust if needed |
+| Per-member report sections | All 3 | `report.tex` is the source — Aaditya's sections done. Pranav: data pipeline + vector store + CoT sections. Tanish: app, deployment, report quality sections. |
+| Market baseline | — | Not deliverable — Kaggle odds CSV schema mismatch, 0 matches. Documented in report Limitations. |
+| Star player absence breakdown | — | Not deliverable — no per-day injury history. Documented in report Limitations. |
+
+---
 
 ---
 
