@@ -27,7 +27,8 @@ import type {
   UpcomingGame,
 } from "@/types";
 
-const BASE = "/api";
+const API_ROOT = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
+const BASE = `${API_ROOT}/api`;
 
 async function get<T>(path: string, params?: Record<string, string | number | undefined>): Promise<T> {
   const url = new URL(BASE + path, window.location.origin);
@@ -38,7 +39,7 @@ async function get<T>(path: string, params?: Record<string, string | number | un
       }
     }
   }
-  const res = await fetch(url.toString().replace(window.location.origin, ""));
+  const res = await fetch(url.toString());
   if (!res.ok) {
     throw new Error(`GET ${path} failed: ${res.status}`);
   }
